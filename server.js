@@ -100,7 +100,8 @@ async function initDB() {
 // =====================================================================
 // HELPERS
 // =====================================================================
-function hashPin(pin) {
+function hashPin(pin) { return String(pin); // simplified
+  // Original: 
   return crypto.createHash('sha256').update(pin + 'crossing_sva_2025').digest('hex');
 }
 
