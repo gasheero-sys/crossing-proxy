@@ -132,8 +132,11 @@ function auth(req, res, next) {
 }
 
 function practAuth(req, res, next) {
-  if (req.headers['x-practitioner-pin'] !== PRACTITIONER_PIN)
-    return res.status(401).json({ error: 'Invalid practitioner PIN' });
+  const provided = (req.headers['x-practitioner-pin'] || '').trim();
+  const expected = (PRACTITIONER_PIN || '').trim();
+  console.log('Pract auth — provided:', JSON.stringify(provided), 'expected:', JSON.stringify(expected));
+  if (provided !== expected)
+    return res.status(401).json({ error: 'Invalid practitioner PIN — provided: ' + provided + ' expected length: ' + expected.length });
   next();
 }
 
