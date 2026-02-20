@@ -8,6 +8,10 @@ const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const PRACTITIONER_PIN = process.env.PRACTITIONER_PIN || '0000';
 
+// Log environment on startup
+console.log('DATABASE_URL set:', !!process.env.DATABASE_URL);
+console.log('DATABASE_URL prefix:', (process.env.DATABASE_URL || '').slice(0, 30));
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
@@ -16,12 +20,12 @@ const pool = new Pool({
 app.use(cors());
 app.use(express.json({ limit: '4mb' }));
 
-// =====================================================================
-// DATABASE SETUP
-// =====================================================================
 async function initDB() {
-  const client = await pool.connect();
+  console.log('Attempting DB connection...');
+  let client;
   try {
+    client = await pool.connect();
+    console.log('DB connected successfully');
     await client.query(`
       CREATE TABLE IF NOT EXISTS clients (
         id SERIAL PRIMARY KEY,
@@ -92,18 +96,17 @@ async function initDB() {
       );
     `);
     console.log('Database ready');
+  } catch(err) {
+    console.error('DB init failed:', err.message);
+    console.error('DB error code:', err.code);
+    console.error('DB error detail:', err.detail);
+    throw err;
   } finally {
-    client.release();
+    if (client) client.release();
   }
 }
 
-// =====================================================================
-// HELPERS
-// =====================================================================
-function hashPin(pin) { return String(pin); // simplified
-  // Original: 
-  return crypto.createHash('sha256').update(pin + 'crossing_sva_2025').digest('hex');
-}
+function hashPin(pin) { return String(pin); }
 
 const tokens = new Map();
 
@@ -134,55 +137,38 @@ function practAuth(req, res, next) {
   next();
 }
 
-// =====================================================================
-// HEALTH
-// =====================================================================
 app.get('/', (req, res) => {
-  res.json({ status: 'Crossing server running', version: '2.0' });
+  res.json({ status: 'Crossing server running', version: '2.0', db: !!process.env.DATABASE_URL });
 });
 
-// =====================================================================
-// AUTH
-// =====================================================================
-app.post('/auth/register', async (req, res) => {
-  const { name, pin } = req.body;
-  if (!name || !pin || String(pin).length < 4)
-    return res.status(400).json({ error: 'Name and a 4-digit PIN are required.' });
+// Login or register by name only — no PIN
+app.post('/auth/login-or-register', async (req, res) => {
+  const { name } = req.body;
+  if (!name || !name.trim())
+    return res.status(400).json({ error: 'Please enter your name.' });
+  const cleanName = name.trim();
   try {
+    // Try to find existing client
+    const existing = await pool.query(
+      'SELECT id, name FROM clients WHERE LOWER(name)=LOWER($1)', [cleanName]
+    );
+    if (existing.rows.length) {
+      const c = existing.rows[0];
+      await pool.query('UPDATE clients SET last_seen=NOW() WHERE id=$1', [c.id]);
+      return res.json({ token: createToken(c.id, c.name), clientId: c.id, name: c.name, isNew: false });
+    }
+    // Register new client
     const result = await pool.query(
       'INSERT INTO clients (name, pin_hash) VALUES ($1, $2) RETURNING id, name',
-      [name.trim(), hashPin(String(pin))]
+      [cleanName, 'no-pin']
     );
     const c = result.rows[0];
-    res.json({ token: createToken(c.id, c.name), clientId: c.id, name: c.name });
-  } catch (err) {
-    if (err.code === '23505')
-      return res.status(409).json({ error: 'That name is already registered. Try logging in instead.' });
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/auth/login', async (req, res) => {
-  const { name, pin } = req.body;
-  if (!name || !pin) return res.status(400).json({ error: 'Name and PIN required.' });
-  try {
-    const result = await pool.query(
-      'SELECT id, name FROM clients WHERE LOWER(name)=LOWER($1) AND pin_hash=$2',
-      [name.trim(), hashPin(String(pin))]
-    );
-    if (!result.rows.length)
-      return res.status(401).json({ error: 'Name or PIN not recognised.' });
-    const c = result.rows[0];
-    await pool.query('UPDATE clients SET last_seen=NOW() WHERE id=$1', [c.id]);
-    res.json({ token: createToken(c.id, c.name), clientId: c.id, name: c.name });
+    res.json({ token: createToken(c.id, c.name), clientId: c.id, name: c.name, isNew: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// =====================================================================
-// SESSIONS
-// =====================================================================
 app.post('/sessions/start', auth, async (req, res) => {
   try {
     const n = await pool.query('SELECT COUNT(*) FROM sessions WHERE client_id=$1', [req.clientId]);
@@ -206,9 +192,6 @@ app.post('/sessions/:id/end', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// =====================================================================
-// DATA SAVE
-// =====================================================================
 app.post('/data/story', auth, async (req, res) => {
   const { sessionId, pointA, pointB, obstacle, attempts, resources, meaningMade } = req.body;
   try {
@@ -278,19 +261,15 @@ app.post('/data/ecosystem', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// =====================================================================
-// DATA LOAD (restore on login)
-// =====================================================================
 app.get('/data/load', auth, async (req, res) => {
   const id = req.clientId;
   try {
-    const story     = await pool.query('SELECT * FROM story_arc WHERE client_id=$1 ORDER BY updated_at DESC LIMIT 1', [id]);
-    const needs     = await pool.query('SELECT * FROM need_scores WHERE client_id=$1 ORDER BY recorded_at DESC LIMIT 1', [id]);
-    const assign    = await pool.query('SELECT * FROM assignments WHERE client_id=$1 ORDER BY created_at DESC LIMIT 1', [id]);
-    const affect    = await pool.query('SELECT * FROM affect_measurements WHERE client_id=$1 ORDER BY recorded_at DESC LIMIT 10', [id]);
-    const eco       = await pool.query('SELECT * FROM ecosystem WHERE client_id=$1', [id]);
-    const lastSess  = await pool.query('SELECT * FROM sessions WHERE client_id=$1 ORDER BY started_at DESC LIMIT 1', [id]);
-
+    const story    = await pool.query('SELECT * FROM story_arc WHERE client_id=$1 ORDER BY updated_at DESC LIMIT 1', [id]);
+    const needs    = await pool.query('SELECT * FROM need_scores WHERE client_id=$1 ORDER BY recorded_at DESC LIMIT 1', [id]);
+    const assign   = await pool.query('SELECT * FROM assignments WHERE client_id=$1 ORDER BY created_at DESC LIMIT 1', [id]);
+    const affect   = await pool.query('SELECT * FROM affect_measurements WHERE client_id=$1 ORDER BY recorded_at DESC LIMIT 10', [id]);
+    const eco      = await pool.query('SELECT * FROM ecosystem WHERE client_id=$1', [id]);
+    const lastSess = await pool.query('SELECT * FROM sessions WHERE client_id=$1 ORDER BY started_at DESC LIMIT 1', [id]);
     const weekStart = new Date();
     weekStart.setDate(weekStart.getDate() - weekStart.getDay() + 1);
     weekStart.setHours(0,0,0,0);
@@ -298,7 +277,6 @@ app.get('/data/load', auth, async (req, res) => {
       'SELECT COUNT(*) FROM sessions WHERE client_id=$1 AND started_at>=$2',
       [id, weekStart.toISOString()]
     );
-
     res.json({
       story: story.rows[0] || null,
       needs: needs.rows[0] || null,
@@ -311,9 +289,6 @@ app.get('/data/load', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// =====================================================================
-// PRACTITIONER DASHBOARD
-// =====================================================================
 app.get('/practitioner/clients', practAuth, async (req, res) => {
   try {
     const result = await pool.query(`
@@ -333,24 +308,21 @@ app.get('/practitioner/clients', practAuth, async (req, res) => {
 app.get('/practitioner/client/:id', practAuth, async (req, res) => {
   const id = req.params.id;
   try {
-    const client   = await pool.query('SELECT * FROM clients WHERE id=$1', [id]);
+    const client  = await pool.query('SELECT * FROM clients WHERE id=$1', [id]);
     if (!client.rows.length) return res.status(404).json({ error: 'Not found' });
     const sessions = await pool.query('SELECT * FROM sessions WHERE client_id=$1 ORDER BY started_at DESC', [id]);
-    const story    = await pool.query('SELECT * FROM story_arc WHERE client_id=$1 ORDER BY updated_at DESC', [id]);
-    const needs    = await pool.query('SELECT * FROM need_scores WHERE client_id=$1 ORDER BY recorded_at ASC', [id]);
-    const affect   = await pool.query('SELECT * FROM affect_measurements WHERE client_id=$1 ORDER BY recorded_at ASC', [id]);
-    const assigns  = await pool.query('SELECT * FROM assignments WHERE client_id=$1 ORDER BY created_at DESC', [id]);
-    const eco      = await pool.query('SELECT * FROM ecosystem WHERE client_id=$1', [id]);
-    const convos   = await pool.query('SELECT * FROM conversations WHERE client_id=$1 ORDER BY recorded_at ASC', [id]);
+    const story   = await pool.query('SELECT * FROM story_arc WHERE client_id=$1 ORDER BY updated_at DESC', [id]);
+    const needs   = await pool.query('SELECT * FROM need_scores WHERE client_id=$1 ORDER BY recorded_at ASC', [id]);
+    const affect  = await pool.query('SELECT * FROM affect_measurements WHERE client_id=$1 ORDER BY recorded_at ASC', [id]);
+    const assigns = await pool.query('SELECT * FROM assignments WHERE client_id=$1 ORDER BY created_at DESC', [id]);
+    const eco     = await pool.query('SELECT * FROM ecosystem WHERE client_id=$1', [id]);
+    const convos  = await pool.query('SELECT * FROM conversations WHERE client_id=$1 ORDER BY recorded_at ASC', [id]);
     res.json({ client: client.rows[0], sessions: sessions.rows, story: story.rows,
       needHistory: needs.rows, affectHistory: affect.rows, assignments: assigns.rows,
       ecosystem: eco.rows, conversations: convos.rows });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// =====================================================================
-// ANTHROPIC PROXY
-// =====================================================================
 app.post('/api/messages', async (req, res) => {
   if (!ANTHROPIC_API_KEY)
     return res.status(500).json({ error: { message: 'ANTHROPIC_API_KEY not set on server.' } });
@@ -371,9 +343,6 @@ app.post('/api/messages', async (req, res) => {
   }
 });
 
-// =====================================================================
-// START
-// =====================================================================
 initDB().then(() => {
   app.listen(PORT, () => console.log(`Crossing server v2 on port ${PORT}`));
 }).catch(err => {
