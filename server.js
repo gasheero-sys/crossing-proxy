@@ -350,6 +350,20 @@ app.get('/practitioner/client/:id', practAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.post('/practitioner/save-analysis/:id', practAuth, async (req, res) => {
+  const id = req.params.id;
+  const { bio, psycho, social, behav, narr, eco, phenom, epist, hist, synthesis } = req.body;
+  try {
+    // Delete any existing null-session analysis for this client, then insert fresh
+    await pool.query('DELETE FROM sva_analysis WHERE client_id=$1 AND session_id IS NULL', [id]);
+    await pool.query(
+      'INSERT INTO sva_analysis (client_id,session_id,bio,psycho,social,behav,narr,eco,phenom,epist,hist,synthesis) VALUES ($1,NULL,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)',
+      [id, bio, psycho, social, behav, narr, eco, phenom, epist, hist, synthesis]
+    );
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post('/api/messages', async (req, res) => {
   if (!ANTHROPIC_API_KEY)
     return res.status(500).json({ error: { message: 'ANTHROPIC_API_KEY not set on server.' } });
