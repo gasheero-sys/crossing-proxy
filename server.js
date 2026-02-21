@@ -331,13 +331,6 @@ app.get('/practitioner/clients', practAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Temporary debug endpoint — raw affect rows for a client (no auth for browser access)
-app.get('/debug/affect/:id', async (req, res) => {
-  try {
-    const rows = await pool.query('SELECT * FROM affect_measurements WHERE client_id=$1 ORDER BY recorded_at ASC', [req.params.id]);
-    res.json({ count: rows.rows.length, rows: rows.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
 
 app.get('/practitioner/client/:id', practAuth, async (req, res) => {
   const id = req.params.id;
