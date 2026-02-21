@@ -94,6 +94,15 @@ async function initDB() {
         person_type TEXT,
         needs_provided TEXT[]
       );
+      CREATE TABLE IF NOT EXISTS sva_analysis (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
+        bio TEXT, psycho TEXT, social TEXT, behav TEXT, narr TEXT,
+        eco TEXT, phenom TEXT, epist TEXT, hist TEXT, synthesis TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(client_id, session_id)
+      );
     `);
     console.log('Database ready');
   } catch(err) {
@@ -264,6 +273,20 @@ app.post('/data/ecosystem', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.post('/data/analysis', auth, async (req, res) => {
+  const { sessionId, bio, psycho, social, behav, narr, eco, phenom, epist, hist, synthesis } = req.body;
+  try {
+    await pool.query(
+      `INSERT INTO sva_analysis (client_id,session_id,bio,psycho,social,behav,narr,eco,phenom,epist,hist,synthesis)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       ON CONFLICT (client_id,session_id) DO UPDATE SET
+         bio=$3,psycho=$4,social=$5,behav=$6,narr=$7,eco=$8,phenom=$9,epist=$10,hist=$11,synthesis=$12,created_at=NOW()`,
+      [req.clientId, sessionId||null, bio, psycho, social, behav, narr, eco, phenom, epist, hist, synthesis]
+    );
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/data/load', auth, async (req, res) => {
   const id = req.clientId;
   try {
@@ -320,9 +343,10 @@ app.get('/practitioner/client/:id', practAuth, async (req, res) => {
     const assigns = await pool.query('SELECT * FROM assignments WHERE client_id=$1 ORDER BY created_at DESC', [id]);
     const eco     = await pool.query('SELECT * FROM ecosystem WHERE client_id=$1', [id]);
     const convos  = await pool.query('SELECT * FROM conversations WHERE client_id=$1 ORDER BY recorded_at ASC', [id]);
+    const analysis = await pool.query('SELECT * FROM sva_analysis WHERE client_id=$1 ORDER BY created_at DESC LIMIT 1', [id]);
     res.json({ client: client.rows[0], sessions: sessions.rows, story: story.rows,
       needHistory: needs.rows, affectHistory: affect.rows, assignments: assigns.rows,
-      ecosystem: eco.rows, conversations: convos.rows });
+      ecosystem: eco.rows, conversations: convos.rows, svaAnalysis: analysis.rows[0] || null });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
