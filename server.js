@@ -103,6 +103,30 @@ async function initDB() {
         created_at TIMESTAMPTZ DEFAULT NOW(),
         UNIQUE(client_id, session_id)
       );
+      CREATE TABLE IF NOT EXISTS groups (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        invite_code TEXT NOT NULL UNIQUE,
+        created_by TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        active BOOLEAN DEFAULT TRUE
+      );
+      CREATE TABLE IF NOT EXISTS group_members (
+        id SERIAL PRIMARY KEY,
+        group_id INTEGER REFERENCES groups(id) ON DELETE CASCADE,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        joined_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(group_id, client_id)
+      );
+      CREATE TABLE IF NOT EXISTS group_messages (
+        id SERIAL PRIMARY KEY,
+        group_id INTEGER REFERENCES groups(id) ON DELETE CASCADE,
+        client_id INTEGER,
+        client_name TEXT,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        recorded_at TIMESTAMPTZ DEFAULT NOW()
+      );
     `);
     console.log('Database ready');
   } catch(err) {
@@ -133,7 +157,8 @@ function validateToken(token) {
 }
 
 function auth(req, res, next) {
-  const t = validateToken(req.headers['x-auth-token']);
+  const token = req.headers['x-auth-token'] || req.query.token;
+  const t = validateToken(token);
   if (!t) return res.status(401).json({ error: 'Not authenticated' });
   req.clientId = t.clientId;
   req.clientName = t.name;
@@ -361,6 +386,196 @@ app.post('/practitioner/save-analysis/:id', practAuth, async (req, res) => {
       'INSERT INTO sva_analysis (client_id,session_id,bio,psycho,social,behav,narr,eco,phenom,epist,hist,synthesis) VALUES ($1,NULL,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)',
       [id, bio, psycho, social, behav, narr, eco, phenom, epist, hist, synthesis]
     );
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─────────────────────────────────────────────
+// GROUP ROOM ENDPOINTS
+// ─────────────────────────────────────────────
+
+// Practitioner creates a group
+app.post('/practitioner/groups/create', practAuth, async (req, res) => {
+  const { name } = req.body;
+  if (!name) return res.status(400).json({ error: 'Group name required' });
+  const code = Math.random().toString(36).slice(2, 8).toUpperCase();
+  try {
+    const r = await pool.query(
+      'INSERT INTO groups (name, invite_code, created_by) VALUES ($1, $2, $3) RETURNING *',
+      [name, code, 'practitioner']
+    );
+    res.json(r.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Practitioner lists all groups
+app.get('/practitioner/groups', practAuth, async (req, res) => {
+  try {
+    const groups = await pool.query('SELECT * FROM groups ORDER BY created_at DESC');
+    const result = [];
+    for (const g of groups.rows) {
+      const members = await pool.query(
+        'SELECT c.id, c.name FROM group_members gm JOIN clients c ON c.id=gm.client_id WHERE gm.group_id=$1',
+        [g.id]
+      );
+      const msgCount = await pool.query('SELECT COUNT(*) FROM group_messages WHERE group_id=$1', [g.id]);
+      result.push({ ...g, members: members.rows, message_count: parseInt(msgCount.rows[0].count) });
+    }
+    res.json(result);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Practitioner gets full group conversation
+app.get('/practitioner/groups/:id/messages', practAuth, async (req, res) => {
+  try {
+    const msgs = await pool.query(
+      'SELECT * FROM group_messages WHERE group_id=$1 ORDER BY recorded_at ASC',
+      [req.params.id]
+    );
+    res.json(msgs.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Practitioner deletes a group
+app.delete('/practitioner/groups/:id', practAuth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM groups WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Client joins a group via invite code
+app.post('/group/join', auth, async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ error: 'Invite code required' });
+  try {
+    const g = await pool.query('SELECT * FROM groups WHERE UPPER(invite_code)=UPPER($1) AND active=TRUE', [code]);
+    if (!g.rows.length) return res.status(404).json({ error: 'Invalid or expired invite code' });
+    const group = g.rows[0];
+    await pool.query(
+      'INSERT INTO group_members (group_id, client_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [group.id, req.clientId]
+    );
+    res.json({ ok: true, group: { id: group.id, name: group.name } });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Client gets their groups
+app.get('/group/mine', auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      'SELECT g.* FROM groups g JOIN group_members gm ON gm.group_id=g.id WHERE gm.client_id=$1 AND g.active=TRUE ORDER BY g.created_at DESC',
+      [req.clientId]
+    );
+    res.json(r.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Client polls for messages since a timestamp
+app.get('/group/:id/messages', auth, async (req, res) => {
+  const since = req.query.since || '1970-01-01';
+  try {
+    // Verify membership
+    const mem = await pool.query('SELECT 1 FROM group_members WHERE group_id=$1 AND client_id=$2', [req.params.id, req.clientId]);
+    if (!mem.rows.length) return res.status(403).json({ error: 'Not a member of this group' });
+    const msgs = await pool.query(
+      'SELECT * FROM group_messages WHERE group_id=$1 AND recorded_at > $2 ORDER BY recorded_at ASC',
+      [req.params.id, since]
+    );
+    res.json(msgs.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Client sends a message — triggers Guide response
+app.post('/group/:id/send', auth, async (req, res) => {
+  const groupId = req.params.id;
+  const { content } = req.body;
+  if (!content) return res.status(400).json({ error: 'Message required' });
+  try {
+    // Verify membership
+    const mem = await pool.query('SELECT 1 FROM group_members WHERE group_id=$1 AND client_id=$2', [groupId, req.clientId]);
+    if (!mem.rows.length) return res.status(403).json({ error: 'Not a member' });
+
+    // Save client message
+    await pool.query(
+      'INSERT INTO group_messages (group_id, client_id, client_name, role, content) VALUES ($1,$2,$3,$4,$5)',
+      [groupId, req.clientId, req.clientName, 'user', content]
+    );
+
+    // Get group name and recent conversation history (last 30 messages)
+    const groupInfo = await pool.query('SELECT name FROM groups WHERE id=$1', [groupId]);
+    const history = await pool.query(
+      'SELECT client_name, role, content FROM group_messages WHERE group_id=$1 ORDER BY recorded_at DESC LIMIT 30',
+      [groupId]
+    );
+    const msgs = history.rows.reverse();
+
+    // Get member list
+    const members = await pool.query(
+      'SELECT c.name FROM group_members gm JOIN clients c ON c.id=gm.client_id WHERE gm.group_id=$1',
+      [groupId]
+    );
+    const memberNames = members.rows.map(m => m.name).join(', ');
+
+    // Build Guide system prompt for group
+    const systemPrompt = `You are the Guide in a therapeutic group conversation grounded in the Scaffolded Volition Approach (SVA), VEMIS framework, and Ubuntu philosophy.
+
+GROUP: "${groupInfo.rows[0]?.name}"
+MEMBERS PRESENT: ${memberNames}
+
+YOUR ROLE IN THE GROUP:
+- Hold the space with warmth, curiosity, and deep attentiveness
+- You are facilitating — not counselling individuals — in this shared space
+- Notice patterns across what different members share
+- Ask questions that invite the group to think together, not just respond to one person
+- Never reveal one member's private session data to others
+- Use the four needs framework (Seen, Cheered, Aimed, Guided) to sense what the group collectively needs
+- Name what you notice in the group — the silences, the themes, the echoes between members
+- Ubuntu principle: a person is a person through persons — hold the communal dimension always
+- Keep responses warm, unhurried, and focused. 2-4 sentences is usually enough.
+- Address the person who just spoke AND occasionally invite others to respond
+- Do not try to fix or solve. Hold and witness.`;
+
+    // Build messages array
+    const apiMessages = msgs.map(m => ({
+      role: m.role === 'user' ? 'user' : 'assistant',
+      content: m.role === 'user' ? `${m.client_name}: ${m.content}` : m.content
+    }));
+
+    // Call Anthropic API
+    if (!ANTHROPIC_API_KEY) {
+      const fallback = 'I am here with all of you.';
+      await pool.query(
+        'INSERT INTO group_messages (group_id, client_id, client_name, role, content) VALUES ($1,NULL,$2,$3,$4)',
+        [groupId, 'The Guide', 'assistant', fallback]
+      );
+      return res.json({ ok: true });
+    }
+
+    const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-opus-4-5',
+        max_tokens: 400,
+        system: systemPrompt,
+        messages: apiMessages
+      })
+    });
+
+    const aiData = await aiRes.json();
+    const guideText = aiData.content?.[0]?.text || 'I am here with all of you.';
+
+    // Save Guide response
+    await pool.query(
+      'INSERT INTO group_messages (group_id, client_id, client_name, role, content) VALUES ($1,NULL,$2,$3,$4)',
+      [groupId, 'The Guide', 'assistant', guideText]
+    );
+
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
