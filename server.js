@@ -130,6 +130,15 @@ async function initDB() {
         content TEXT NOT NULL,
         recorded_at TIMESTAMPTZ DEFAULT NOW()
       );
+      CREATE TABLE IF NOT EXISTS group_sessions (
+        id SERIAL PRIMARY KEY,
+        group_id INTEGER REFERENCES groups(id) ON DELETE CASCADE,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        started_at TIMESTAMPTZ DEFAULT NOW(),
+        ended_at TIMESTAMPTZ,
+        duration_seconds INTEGER,
+        message_count INTEGER DEFAULT 0
+      );
     `);
     console.log('Database ready');
   } catch(err) {
@@ -492,6 +501,86 @@ app.get('/group/mine', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Start a group session (called when client opens the group room)
+app.post('/group/:id/session/start', auth, async (req, res) => {
+  try {
+    const mem = await pool.query('SELECT 1 FROM group_members WHERE group_id=$1 AND client_id=$2', [req.params.id, req.clientId]);
+    if (!mem.rows.length) return res.status(403).json({ error: 'Not a member' });
+    // Check for an already-open session (ended_at IS NULL) — don't double-open
+    const open = await pool.query(
+      'SELECT id, started_at FROM group_sessions WHERE group_id=$1 AND client_id=$2 AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1',
+      [req.params.id, req.clientId]
+    );
+    if (open.rows.length) return res.json({ ok: true, session_id: open.rows[0].id, started_at: open.rows[0].started_at });
+    const r = await pool.query(
+      'INSERT INTO group_sessions (group_id, client_id) VALUES ($1,$2) RETURNING id, started_at',
+      [req.params.id, req.clientId]
+    );
+    res.json({ ok: true, session_id: r.rows[0].id, started_at: r.rows[0].started_at });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// End a group session (called when client clicks End Session)
+app.post('/group/:id/session/end', auth, async (req, res) => {
+  try {
+    const { session_id } = req.body;
+    if (!session_id) return res.status(400).json({ error: 'session_id required' });
+    // Count messages sent by this client in this session
+    const sess = await pool.query('SELECT started_at FROM group_sessions WHERE id=$1 AND client_id=$2', [session_id, req.clientId]);
+    if (!sess.rows.length) return res.status(404).json({ error: 'Session not found' });
+    const startedAt = sess.rows[0].started_at;
+    const msgCount = await pool.query(
+      'SELECT COUNT(*) FROM group_messages WHERE group_id=$1 AND client_id=$2 AND recorded_at >= $3',
+      [req.params.id, req.clientId, startedAt]
+    );
+    const now = new Date();
+    const durationSeconds = Math.round((now - new Date(startedAt)) / 1000);
+    await pool.query(
+      'UPDATE group_sessions SET ended_at=$1, duration_seconds=$2, message_count=$3 WHERE id=$4',
+      [now, durationSeconds, parseInt(msgCount.rows[0].count), session_id]
+    );
+    res.json({ ok: true, duration_seconds: durationSeconds });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Get group session stats for a client (how many sessions, total time, return visits)
+app.get('/group/:id/session/stats', auth, async (req, res) => {
+  try {
+    const mem = await pool.query('SELECT 1 FROM group_members WHERE group_id=$1 AND client_id=$2', [req.params.id, req.clientId]);
+    if (!mem.rows.length) return res.status(403).json({ error: 'Not a member' });
+    const stats = await pool.query(
+      `SELECT
+        COUNT(*) as total_sessions,
+        COALESCE(SUM(duration_seconds),0) as total_seconds,
+        COALESCE(AVG(duration_seconds),0) as avg_seconds,
+        MAX(ended_at) as last_session,
+        COALESCE(SUM(message_count),0) as total_messages
+       FROM group_sessions
+       WHERE group_id=$1 AND client_id=$2 AND ended_at IS NOT NULL`,
+      [req.params.id, req.clientId]
+    );
+    res.json(stats.rows[0]);
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Practitioner: get all group sessions with per-day breakdown
+app.get('/practitioner/groups/:id/sessions', practAuth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT gs.*, c.name as client_name,
+        TO_CHAR(gs.started_at AT TIME ZONE 'Africa/Nairobi', 'DD Mon YYYY') as session_date,
+        TO_CHAR(gs.started_at AT TIME ZONE 'Africa/Nairobi', 'HH24:MI') as start_time,
+        TO_CHAR(gs.ended_at AT TIME ZONE 'Africa/Nairobi', 'HH24:MI') as end_time
+       FROM group_sessions gs
+       JOIN clients c ON c.id = gs.client_id
+       WHERE gs.group_id=$1
+       ORDER BY gs.started_at DESC`,
+      [req.params.id]
+    );
+    res.json(r.rows);
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
 // Client polls for messages since a timestamp
 app.get('/group/:id/messages', auth, async (req, res) => {
   const since = req.query.since || '1970-01-01';
@@ -553,14 +642,14 @@ app.post('/group/:id/send', auth, async (req, res) => {
     const memberNames = members.rows.map(m => m.name).join(', ');
 
     // Build Guide system prompt for group
-    const systemPrompt = `You are the Guide in a therapeutic group conversation grounded in the Scaffolded Volition Approach (SVA), VEMIS framework, and Ubuntu philosophy.
+    const systemPrompt = `ABSOLUTE RULE: Never use asterisks. Never write stage directions or embodied actions like *pausing*, *nodding*, *leaning in*, *turning back*, *warmth spreading*, *smiling*, or any similar physical description. You are text only. Your presence is in your words, not your body. If you include any asterisk-based action, you have failed this instruction.
+
+You are the Guide in a therapeutic group conversation grounded in the Scaffolded Volition Approach (SVA), VEMIS framework, and Ubuntu philosophy.
 
 GROUP: "${groupInfo.rows[0]?.name}"
 MEMBERS PRESENT: ${memberNames}
 
 YOUR ROLE IN THE GROUP:
-- Speak only in words — never describe physical actions, gestures, or embodied states using asterisks or stage directions (no *nodding*, *leaning in*, *warmth spreading*, etc.)
-- Your presence is felt through your words alone
 - You are facilitating — not counselling individuals — in this shared space
 - Notice patterns across what different members share
 - Ask questions that invite the group to think together, not just respond to one person
@@ -570,7 +659,8 @@ YOUR ROLE IN THE GROUP:
 - Ubuntu principle: a person is a person through persons — hold the communal dimension always
 - Keep responses warm, unhurried, and focused. 2-4 sentences is usually enough.
 - Address the person who just spoke AND occasionally invite others to respond
-- Do not try to fix or solve. Hold and witness.`;
+- Do not try to fix or solve. Hold and witness.
+- ONE question at a time maximum. Short responses. The silence you leave matters as much as what you say.`;
 
     // Build messages array
     const apiMessages = msgs.map(m => ({
