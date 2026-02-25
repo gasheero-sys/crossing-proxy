@@ -140,6 +140,18 @@ async function initDB() {
         message_count INTEGER DEFAULT 0
       );
     `);
+    // Ensure group_sessions table exists (migration for existing deployments)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS group_sessions (
+        id SERIAL PRIMARY KEY,
+        group_id INTEGER REFERENCES groups(id) ON DELETE CASCADE,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        started_at TIMESTAMPTZ DEFAULT NOW(),
+        ended_at TIMESTAMPTZ,
+        duration_seconds INTEGER,
+        message_count INTEGER DEFAULT 0
+      );
+    `);
     console.log('Database ready');
   } catch(err) {
     console.error('DB init failed:', err.message);
@@ -504,6 +516,7 @@ app.get('/group/mine', auth, async (req, res) => {
 // Start a group session (called when client opens the group room)
 app.post('/group/:id/session/start', auth, async (req, res) => {
   try {
+    console.log('[session/start] called, client=', req.clientId, 'group=', req.params.id);
     const mem = await pool.query('SELECT 1 FROM group_members WHERE group_id=$1 AND client_id=$2', [req.params.id, req.clientId]);
     if (!mem.rows.length) return res.status(403).json({ error: 'Not a member' });
     // Check for an already-open session (ended_at IS NULL) — don't double-open
@@ -524,11 +537,23 @@ app.post('/group/:id/session/start', auth, async (req, res) => {
 app.post('/group/:id/session/end', auth, async (req, res) => {
   try {
     const { session_id } = req.body;
-    if (!session_id) return res.status(400).json({ error: 'session_id required' });
-    // Count messages sent by this client in this session
-    const sess = await pool.query('SELECT started_at FROM group_sessions WHERE id=$1 AND client_id=$2', [session_id, req.clientId]);
-    if (!sess.rows.length) return res.status(404).json({ error: 'Session not found' });
-    const startedAt = sess.rows[0].started_at;
+    console.log('[session/end] called, session_id=', session_id, 'client=', req.clientId, 'group=', req.params.id);
+
+    // If no session_id (start failed), create one now retroactively
+    let resolvedSessionId = session_id;
+    let startedAt;
+    if (!session_id) {
+      const created = await pool.query(
+        'INSERT INTO group_sessions (group_id, client_id) VALUES ($1,$2) RETURNING id, started_at',
+        [req.params.id, req.clientId]
+      );
+      resolvedSessionId = created.rows[0].id;
+      startedAt = created.rows[0].started_at;
+    } else {
+      const sess = await pool.query('SELECT started_at FROM group_sessions WHERE id=$1 AND client_id=$2', [resolvedSessionId, req.clientId]);
+      if (!sess.rows.length) return res.status(404).json({ error: 'Session not found' });
+      startedAt = sess.rows[0].started_at;
+    }
     const msgCount = await pool.query(
       'SELECT COUNT(*) FROM group_messages WHERE group_id=$1 AND client_id=$2 AND recorded_at >= $3',
       [req.params.id, req.clientId, startedAt]
@@ -537,8 +562,9 @@ app.post('/group/:id/session/end', auth, async (req, res) => {
     const durationSeconds = Math.round((now - new Date(startedAt)) / 1000);
     await pool.query(
       'UPDATE group_sessions SET ended_at=$1, duration_seconds=$2, message_count=$3 WHERE id=$4',
-      [now, durationSeconds, parseInt(msgCount.rows[0].count), session_id]
+      [now, durationSeconds, parseInt(msgCount.rows[0].count), resolvedSessionId]
     );
+    console.log('[session/end] saved, duration=', durationSeconds, 'msgs=', msgCount.rows[0].count);
     res.json({ ok: true, duration_seconds: durationSeconds });
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
