@@ -17,6 +17,9 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// Per-group Guide response lock — prevents concurrent Guide calls for same group
+const groupGuideLocks = new Set();
+
 app.use(cors());
 app.use(express.json({ limit: '4mb' }));
 
@@ -470,55 +473,10 @@ app.post('/group/join', auth, async (req, res) => {
     const g = await pool.query('SELECT * FROM groups WHERE UPPER(invite_code)=UPPER($1) AND active=TRUE', [code]);
     if (!g.rows.length) return res.status(404).json({ error: 'Invalid or expired invite code' });
     const group = g.rows[0];
-    // Check if this client is already a member (ON CONFLICT DO NOTHING means re-join is silent)
-    const alreadyMember = await pool.query(
-      'SELECT 1 FROM group_members WHERE group_id=$1 AND client_id=$2',
-      [group.id, req.clientId]
-    );
-    const isNewMember = alreadyMember.rows.length === 0;
-
     await pool.query(
       'INSERT INTO group_members (group_id, client_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
       [group.id, req.clientId]
     );
-
-    // Send Guide welcome ONLY for new members AND only if no messages exist yet
-    if (isNewMember && ANTHROPIC_API_KEY) {
-      const existingMsgs = await pool.query(
-        'SELECT COUNT(*) FROM group_messages WHERE group_id=$1', [group.id]
-      );
-      const members = await pool.query(
-        'SELECT c.name FROM group_members gm JOIN clients c ON c.id=gm.client_id WHERE gm.group_id=$1',
-        [group.id]
-      );
-      const memberNames = members.rows.map(m => m.name).join(' and ');
-      const clientName = req.clientName || 'you';
-
-      if (parseInt(existingMsgs.rows[0].count) === 0) {
-        // First message ever — send opening welcome
-        try {
-          const welcomeRes = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-            body: JSON.stringify({
-              model: 'claude-opus-4-5',
-              max_tokens: 200,
-              system: `You are the Guide in a therapeutic group space grounded in the Scaffolded Volition Approach. Hold the space with warmth. The group is: ${group.name}. Members joining: ${memberNames}.`,
-              messages: [{ role: 'user', content: `${clientName} has just joined the group space.` }]
-            })
-          });
-          const welcomeData = await welcomeRes.json();
-          const welcomeText = welcomeData.content?.[0]?.text;
-          if (welcomeText) {
-            await pool.query(
-              'INSERT INTO group_messages (group_id, client_id, client_name, role, content) VALUES ($1,NULL,$2,$3,$4)',
-              [group.id, 'The Guide', 'assistant', welcomeText]
-            );
-          }
-        } catch(e) { /* welcome is best-effort */ }
-      }
-    }
-
     res.json({ ok: true, group: { id: group.id, name: group.name } });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -559,11 +517,25 @@ app.post('/group/:id/send', auth, async (req, res) => {
     const mem = await pool.query('SELECT 1 FROM group_members WHERE group_id=$1 AND client_id=$2', [groupId, req.clientId]);
     if (!mem.rows.length) return res.status(403).json({ error: 'Not a member' });
 
+    // Prevent concurrent Guide responses for this group
+    if (groupGuideLocks.has(groupId)) {
+      // Still save the client message, just skip Guide response this time
+      await pool.query(
+        'INSERT INTO group_messages (group_id, client_id, client_name, role, content) VALUES ($1,$2,$3,$4,$5)',
+        [groupId, req.clientId, req.clientName, 'user', content]
+      );
+      return res.json({ ok: true, queued: true });
+    }
+    groupGuideLocks.add(groupId);
+
     // Save client message
     await pool.query(
       'INSERT INTO group_messages (group_id, client_id, client_name, role, content) VALUES ($1,$2,$3,$4,$5)',
       [groupId, req.clientId, req.clientName, 'user', content]
     );
+
+    // Respond to client immediately — Guide runs async so Railway timeout never triggers retry
+    res.json({ ok: true });
 
     // Get group name and recent conversation history (last 30 messages)
     const groupInfo = await pool.query('SELECT name FROM groups WHERE id=$1', [groupId]);
@@ -612,7 +584,8 @@ YOUR ROLE IN THE GROUP:
         'INSERT INTO group_messages (group_id, client_id, client_name, role, content) VALUES ($1,NULL,$2,$3,$4)',
         [groupId, 'The Guide', 'assistant', fallback]
       );
-      return res.json({ ok: true });
+      groupGuideLocks.delete(groupId);
+      return;
     }
 
     const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -639,8 +612,11 @@ YOUR ROLE IN THE GROUP:
       [groupId, 'The Guide', 'assistant', guideText]
     );
 
-    res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    groupGuideLocks.delete(groupId);
+  } catch (err) {
+    groupGuideLocks.delete(groupId);
+    console.error('Group send error:', err.message);
+  }
 });
 
 app.post('/api/messages', async (req, res) => {
