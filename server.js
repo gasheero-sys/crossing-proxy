@@ -444,6 +444,24 @@ app.delete('/practitioner/groups/:id', practAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Practitioner: delete duplicate consecutive Guide messages from a group
+app.delete('/practitioner/groups/:id/duplicate-messages', practAuth, async (req, res) => {
+  try {
+    // Delete all but the FIRST Guide message in this group
+    await pool.query(`
+      DELETE FROM group_messages
+      WHERE group_id=$1 AND role='assistant'
+      AND id NOT IN (
+        SELECT id FROM group_messages
+        WHERE group_id=$1 AND role='assistant'
+        ORDER BY recorded_at ASC
+        LIMIT 1
+      )
+    `, [req.params.id]);
+    res.json({ ok: true });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
 // Client joins a group via invite code
 app.post('/group/join', auth, async (req, res) => {
   const { code } = req.body;
