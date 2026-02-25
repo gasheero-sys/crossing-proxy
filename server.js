@@ -315,6 +315,29 @@ app.post('/data/conversation', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Bulk save all conversation messages at once (used at session end for reliability)
+app.post('/data/conversation/bulk', auth, async (req, res) => {
+  const { sessionId, messages } = req.body;
+  if (!Array.isArray(messages) || !messages.length) return res.json({ ok: true, saved: 0 });
+  try {
+    // Check how many messages already saved for this session to avoid duplicates
+    const existing = sessionId ? await pool.query(
+      'SELECT COUNT(*) FROM conversations WHERE client_id=$1 AND session_id=$2',
+      [req.clientId, sessionId]
+    ) : { rows: [{ count: '0' }] };
+    const alreadySaved = parseInt(existing.rows[0].count);
+    // Only save messages we haven't saved yet
+    const toSave = messages.slice(alreadySaved);
+    for (const m of toSave) {
+      await pool.query(
+        'INSERT INTO conversations (client_id,session_id,role,content) VALUES ($1,$2,$3,$4)',
+        [req.clientId, sessionId||null, m.role, m.content]
+      );
+    }
+    res.json({ ok: true, saved: toSave.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post('/data/assignment', auth, async (req, res) => {
   const { sessionId, assignmentText, excavationQuery, commitmentPerson, commitmentWhen } = req.body;
   try {
