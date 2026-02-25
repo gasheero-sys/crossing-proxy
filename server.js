@@ -139,6 +139,13 @@ async function initDB() {
         duration_seconds INTEGER,
         message_count INTEGER DEFAULT 0
       );
+      CREATE TABLE IF NOT EXISTS client_tokens (
+        token TEXT PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        client_name TEXT NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
     `);
     // Ensure group_sessions table exists (migration for existing deployments)
     await pool.query(`
@@ -165,28 +172,37 @@ async function initDB() {
 
 function hashPin(pin) { return String(pin); }
 
-const tokens = new Map();
-
-function createToken(clientId, name) {
+// DB-backed token functions (survive server restarts)
+async function createToken(clientId, name) {
   const token = crypto.randomBytes(32).toString('hex');
-  tokens.set(token, { clientId, name, expires: Date.now() + 7 * 24 * 60 * 60 * 1000 });
+  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
+  await pool.query(
+    'INSERT INTO client_tokens (token, client_id, client_name, expires_at) VALUES ($1,$2,$3,$4) ON CONFLICT (token) DO NOTHING',
+    [token, clientId, name, expiresAt]
+  );
   return token;
 }
 
-function validateToken(token) {
+async function validateToken(token) {
   if (!token) return null;
-  const t = tokens.get(token);
-  if (!t || Date.now() > t.expires) { tokens.delete(token); return null; }
-  return t;
+  try {
+    const r = await pool.query(
+      'SELECT client_id, client_name FROM client_tokens WHERE token=$1 AND expires_at > NOW()',
+      [token]
+    );
+    if (!r.rows.length) return null;
+    return { clientId: r.rows[0].client_id, name: r.rows[0].client_name };
+  } catch(e) { return null; }
 }
 
 function auth(req, res, next) {
   const token = req.headers['x-auth-token'] || req.query.token;
-  const t = validateToken(token);
-  if (!t) return res.status(401).json({ error: 'Not authenticated' });
-  req.clientId = t.clientId;
-  req.clientName = t.name;
-  next();
+  validateToken(token).then(t => {
+    if (!t) return res.status(401).json({ error: 'Not authenticated' });
+    req.clientId = t.clientId;
+    req.clientName = t.name;
+    next();
+  }).catch(() => res.status(401).json({ error: 'Not authenticated' }));
 }
 
 function practAuth(req, res, next) {
@@ -216,7 +232,8 @@ app.post('/auth/login-or-register', async (req, res) => {
     if (existing.rows.length) {
       const c = existing.rows[0];
       await pool.query('UPDATE clients SET last_seen=NOW() WHERE id=$1', [c.id]);
-      return res.json({ token: createToken(c.id, c.name), clientId: c.id, name: c.name, isNew: false });
+      const token1 = await createToken(c.id, c.name);
+      return res.json({ token: token1, clientId: c.id, name: c.name, isNew: false });
     }
     // Register new client
     const result = await pool.query(
@@ -224,7 +241,8 @@ app.post('/auth/login-or-register', async (req, res) => {
       [cleanName, 'no-pin']
     );
     const c = result.rows[0];
-    res.json({ token: createToken(c.id, c.name), clientId: c.id, name: c.name, isNew: true });
+    const token2 = await createToken(c.id, c.name);
+    res.json({ token: token2, clientId: c.id, name: c.name, isNew: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -589,21 +607,54 @@ app.get('/group/:id/session/stats', auth, async (req, res) => {
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
-// Practitioner: get all group sessions with per-day breakdown
+// Practitioner: get group session stats derived from message timestamps (no group_sessions table needed)
 app.get('/practitioner/groups/:id/sessions', practAuth, async (req, res) => {
   try {
+    // Get all non-Guide messages with timestamps, grouped by client
     const r = await pool.query(
-      `SELECT gs.*, c.name as client_name,
-        TO_CHAR(gs.started_at AT TIME ZONE 'Africa/Nairobi', 'DD Mon YYYY') as session_date,
-        TO_CHAR(gs.started_at AT TIME ZONE 'Africa/Nairobi', 'HH24:MI') as start_time,
-        TO_CHAR(gs.ended_at AT TIME ZONE 'Africa/Nairobi', 'HH24:MI') as end_time
-       FROM group_sessions gs
-       JOIN clients c ON c.id = gs.client_id
-       WHERE gs.group_id=$1
-       ORDER BY gs.started_at DESC`,
+      `SELECT
+        client_id, client_name,
+        recorded_at,
+        TO_CHAR(recorded_at AT TIME ZONE 'Africa/Nairobi', 'YYYY-MM-DD') as day,
+        TO_CHAR(recorded_at AT TIME ZONE 'Africa/Nairobi', 'DD Mon YYYY') as day_display,
+        TO_CHAR(recorded_at AT TIME ZONE 'Africa/Nairobi', 'HH24:MI') as time_str
+       FROM group_messages
+       WHERE group_id=$1 AND role='user'
+       ORDER BY client_id, recorded_at ASC`,
       [req.params.id]
     );
-    res.json(r.rows);
+
+    // Group messages by client then by day to infer sessions
+    const byClient = {};
+    r.rows.forEach(row => {
+      if (!byClient[row.client_name]) byClient[row.client_name] = {};
+      if (!byClient[row.client_name][row.day]) byClient[row.client_name][row.day] = [];
+      byClient[row.client_name][row.day].push(row);
+    });
+
+    // Build session summaries per client per day
+    const sessions = [];
+    Object.entries(byClient).forEach(([clientName, days]) => {
+      Object.entries(days).forEach(([day, msgs]) => {
+        const first = msgs[0];
+        const last = msgs[msgs.length - 1];
+        const startTime = new Date(first.recorded_at);
+        const endTime = new Date(last.recorded_at);
+        const durationSeconds = Math.round((endTime - startTime) / 1000);
+        sessions.push({
+          client_name: clientName,
+          session_date: first.day_display,
+          start_time: first.time_str,
+          end_time: last.time_str,
+          duration_seconds: durationSeconds,
+          message_count: msgs.length
+        });
+      });
+    });
+
+    // Sort by date desc
+    sessions.sort((a, b) => b.session_date.localeCompare(a.session_date));
+    res.json(sessions);
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
