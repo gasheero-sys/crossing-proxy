@@ -106,6 +106,29 @@ async function initDB() {
         created_at TIMESTAMPTZ DEFAULT NOW(),
         UNIQUE(client_id, session_id)
       );
+      CREATE TABLE IF NOT EXISTS arc_readings (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER,
+        result JSONB NOT NULL,
+        generated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS eco_reflections (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER,
+        person_name TEXT,
+        emoji_response TEXT,
+        emoji_label TEXT,
+        recorded_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS masking_scores (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER,
+        masking_load INTEGER,
+        recorded_at TIMESTAMPTZ DEFAULT NOW()
+      );
       CREATE TABLE IF NOT EXISTS groups (
         id SERIAL PRIMARY KEY,
         name TEXT NOT NULL,
@@ -157,6 +180,32 @@ async function initDB() {
         ended_at TIMESTAMPTZ,
         duration_seconds INTEGER,
         message_count INTEGER DEFAULT 0
+      );
+    `);
+    // Migrations for new tables on existing deployments
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS arc_readings (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER,
+        result JSONB NOT NULL,
+        generated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS eco_reflections (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER,
+        person_name TEXT,
+        emoji_response TEXT,
+        emoji_label TEXT,
+        recorded_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS masking_scores (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER,
+        masking_load INTEGER,
+        recorded_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
     console.log('Database ready');
@@ -377,6 +426,45 @@ app.post('/data/analysis', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Life Arc reading — save result JSON from Movement Six
+app.post('/data/arc-reading', auth, async (req, res) => {
+  const { sessionId, result } = req.body;
+  if (!result) return res.status(400).json({ error: 'No result provided' });
+  try {
+    // Upsert: one arc reading per client (keep most recent)
+    await pool.query('DELETE FROM arc_readings WHERE client_id=$1', [req.clientId]);
+    await pool.query(
+      'INSERT INTO arc_readings (client_id,session_id,result) VALUES ($1,$2,$3)',
+      [req.clientId, sessionId || null, JSON.stringify(result)]
+    );
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Ecosystem micro-reflection — emoji responses after adding a person
+app.post('/data/eco-reflection', auth, async (req, res) => {
+  const { sessionId, person, response, emoji } = req.body;
+  try {
+    await pool.query(
+      'INSERT INTO eco_reflections (client_id,session_id,person_name,emoji_response,emoji_label) VALUES ($1,$2,$3,$4,$5)',
+      [req.clientId, sessionId || null, person, emoji, response]
+    );
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Masking load score
+app.post('/data/masking', auth, async (req, res) => {
+  const { sessionId, maskingLoad } = req.body;
+  try {
+    await pool.query(
+      'INSERT INTO masking_scores (client_id,session_id,masking_load) VALUES ($1,$2,$3)',
+      [req.clientId, sessionId || null, maskingLoad]
+    );
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/data/load', auth, async (req, res) => {
   const id = req.clientId;
   try {
@@ -435,9 +523,12 @@ app.get('/practitioner/client/:id', practAuth, async (req, res) => {
     const eco     = await pool.query('SELECT * FROM ecosystem WHERE client_id=$1', [id]);
     const convos  = await pool.query('SELECT * FROM conversations WHERE client_id=$1 ORDER BY recorded_at ASC', [id]);
     const analysis = await pool.query('SELECT * FROM sva_analysis WHERE client_id=$1 ORDER BY created_at DESC LIMIT 1', [id]);
+    const arcReading = await pool.query('SELECT * FROM arc_readings WHERE client_id=$1 ORDER BY generated_at DESC LIMIT 1', [id]);
+    const arcResult = arcReading.rows[0] ? { ...arcReading.rows[0].result, generated_at: arcReading.rows[0].generated_at } : null;
     res.json({ client: client.rows[0], sessions: sessions.rows, story: story.rows,
       needHistory: needs.rows, affectHistory: affect.rows, assignments: assigns.rows,
-      ecosystem: eco.rows, conversations: convos.rows, svaAnalysis: analysis.rows[0] || null });
+      ecosystem: eco.rows, conversations: convos.rows, svaAnalysis: analysis.rows[0] || null,
+      arcReading: arcResult });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
