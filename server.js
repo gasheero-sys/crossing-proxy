@@ -169,6 +169,58 @@ async function initDB() {
         expires_at TIMESTAMPTZ NOT NULL,
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
+      CREATE TABLE IF NOT EXISTS persistent_profiles (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE UNIQUE,
+        volition_index INTEGER,
+        seen_score INTEGER, cheered_score INTEGER, aimed_score INTEGER, guided_score INTEGER,
+        masking_trend JSONB DEFAULT '[]',
+        active_patterns JSONB DEFAULT '[]',
+        risk_flags JSONB DEFAULT '[]',
+        next_priorities JSONB DEFAULT '[]',
+        last_assignment TEXT,
+        last_assignment_status TEXT DEFAULT 'pending',
+        session_count INTEGER DEFAULT 0,
+        last_session_summary TEXT,
+        profile_staleness BOOLEAN DEFAULT FALSE,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS session_archives (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER,
+        session_number INTEGER,
+        compressed_summary TEXT,
+        raw_transcript_length INTEGER,
+        assignment_given TEXT,
+        affect_before INTEGER,
+        affect_after INTEGER,
+        masking_load INTEGER,
+        volition_index INTEGER,
+        archived_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS session_architectures (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER,
+        movement_priorities JSONB,
+        risk_flags JSONB DEFAULT '[]',
+        opening_question TEXT,
+        hypothesis_label TEXT,
+        override_conditions TEXT,
+        generated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS sovereign_moments (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER,
+        moment_text TEXT NOT NULL,
+        detection_tier INTEGER DEFAULT 2,
+        confirmed BOOLEAN DEFAULT FALSE,
+        dismissed BOOLEAN DEFAULT FALSE,
+        practitioner_note TEXT,
+        detected_at TIMESTAMPTZ DEFAULT NOW()
+      );
     `);
     // Ensure group_sessions table exists (migration for existing deployments)
     await pool.query(`
@@ -206,6 +258,61 @@ async function initDB() {
         session_id INTEGER,
         masking_load INTEGER,
         recorded_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    // Phase 1 migrations
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS persistent_profiles (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE UNIQUE,
+        volition_index INTEGER,
+        seen_score INTEGER, cheered_score INTEGER, aimed_score INTEGER, guided_score INTEGER,
+        masking_trend JSONB DEFAULT '[]',
+        active_patterns JSONB DEFAULT '[]',
+        risk_flags JSONB DEFAULT '[]',
+        next_priorities JSONB DEFAULT '[]',
+        last_assignment TEXT,
+        last_assignment_status TEXT DEFAULT 'pending',
+        session_count INTEGER DEFAULT 0,
+        last_session_summary TEXT,
+        profile_staleness BOOLEAN DEFAULT FALSE,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS session_archives (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER,
+        session_number INTEGER,
+        compressed_summary TEXT,
+        raw_transcript_length INTEGER,
+        assignment_given TEXT,
+        affect_before INTEGER,
+        affect_after INTEGER,
+        masking_load INTEGER,
+        volition_index INTEGER,
+        archived_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS session_architectures (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER,
+        movement_priorities JSONB,
+        risk_flags JSONB DEFAULT '[]',
+        opening_question TEXT,
+        hypothesis_label TEXT,
+        override_conditions TEXT,
+        generated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS sovereign_moments (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER,
+        moment_text TEXT NOT NULL,
+        detection_tier INTEGER DEFAULT 2,
+        confirmed BOOLEAN DEFAULT FALSE,
+        dismissed BOOLEAN DEFAULT FALSE,
+        practitioner_note TEXT,
+        detected_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
     console.log('Database ready');
@@ -919,6 +1026,497 @@ app.post('/api/messages', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: { message: 'Proxy error: ' + err.message } });
   }
+});
+
+// ─────────────────────────────────────────────
+// PHASE 1: PERSISTENT MEMORY ENDPOINTS
+// ─────────────────────────────────────────────
+
+// GET persistent profile for authenticated client — used by Guide at session start
+app.get('/data/profile', auth, async (req, res) => {
+  try {
+    const profile = await pool.query(
+      'SELECT * FROM persistent_profiles WHERE client_id=$1', [req.clientId]
+    );
+    const sessionCount = await pool.query(
+      'SELECT COUNT(*) FROM sessions WHERE client_id=$1', [req.clientId]
+    );
+    const architecture = await pool.query(
+      `SELECT sa.* FROM session_architectures sa
+       JOIN sessions s ON s.id = sa.session_id
+       WHERE sa.client_id=$1
+       ORDER BY sa.generated_at DESC LIMIT 1`,
+      [req.clientId]
+    );
+    res.json({
+      profile: profile.rows[0] || null,
+      sessionCount: parseInt(sessionCount.rows[0].count),
+      architecture: architecture.rows[0] || null
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /sessions/:id/post-session-jobs — runs archive builder, profile updater, sovereign moment detector
+// Called by client after session end. Runs async — responds immediately, jobs run in background.
+app.post('/sessions/:id/post-session-jobs', auth, async (req, res) => {
+  const sessionId = parseInt(req.params.id);
+  const clientId = req.clientId;
+  res.json({ ok: true, queued: true });
+
+  // Run jobs async — failures are logged but never propagate to client
+  runPostSessionJobs(clientId, sessionId).catch(err => {
+    console.error('[post-session-jobs] fatal error for client', clientId, 'session', sessionId, ':', err.message);
+  });
+});
+
+async function runPostSessionJobs(clientId, sessionId) {
+  console.log('[post-session-jobs] starting for client', clientId, 'session', sessionId);
+
+  if (!ANTHROPIC_API_KEY) {
+    console.warn('[post-session-jobs] no API key — skipping AI jobs, writing raw archive');
+    await writeRawArchive(clientId, sessionId);
+    return;
+  }
+
+  // Job 1: Archive Builder
+  let summary = null;
+  try {
+    summary = await buildSessionArchive(clientId, sessionId);
+    console.log('[post-session-jobs] Job 1 (archive) complete');
+  } catch (err) {
+    console.error('[post-session-jobs] Job 1 (archive) failed:', err.message);
+    await writeRawArchive(clientId, sessionId);
+  }
+
+  // Job 2: Profile Updater
+  try {
+    await updatePersistentProfile(clientId, sessionId, summary);
+    console.log('[post-session-jobs] Job 2 (profile) complete');
+  } catch (err) {
+    console.error('[post-session-jobs] Job 2 (profile) failed:', err.message);
+    // Mark profile stale so practitioner is aware
+    try {
+      await pool.query(
+        `INSERT INTO persistent_profiles (client_id, profile_staleness) VALUES ($1, TRUE)
+         ON CONFLICT (client_id) DO UPDATE SET profile_staleness=TRUE`,
+        [clientId]
+      );
+    } catch (e) { console.error('[post-session-jobs] could not mark profile stale:', e.message); }
+  }
+
+  // Job 3: Sovereign Moment Detector
+  try {
+    await detectSovereignMoments(clientId, sessionId);
+    console.log('[post-session-jobs] Job 3 (sovereign moments) complete');
+  } catch (err) {
+    console.error('[post-session-jobs] Job 3 (sovereign moments) failed:', err.message);
+    // Mark session for manual review — log only, no DB write needed
+    console.warn('[post-session-jobs] session', sessionId, 'flagged for manual sovereign moment review');
+  }
+}
+
+async function writeRawArchive(clientId, sessionId) {
+  try {
+    const sess = await pool.query('SELECT * FROM sessions WHERE id=$1 AND client_id=$2', [sessionId, clientId]);
+    if (!sess.rows.length) return;
+    const s = sess.rows[0];
+    const convos = await pool.query(
+      'SELECT COUNT(*) FROM conversations WHERE session_id=$1 AND client_id=$2', [sessionId, clientId]
+    );
+    await pool.query(
+      `INSERT INTO session_archives (client_id, session_id, session_number, raw_transcript_length, archived_at)
+       VALUES ($1,$2,$3,$4,NOW())
+       ON CONFLICT DO NOTHING`,
+      [clientId, sessionId, s.session_number, parseInt(convos.rows[0].count)]
+    );
+  } catch (err) { console.error('[writeRawArchive] failed:', err.message); }
+}
+
+async function buildSessionArchive(clientId, sessionId) {
+  const sess = await pool.query('SELECT * FROM sessions WHERE id=$1 AND client_id=$2', [sessionId, clientId]);
+  if (!sess.rows.length) throw new Error('Session not found');
+  const s = sess.rows[0];
+
+  const convos = await pool.query(
+    'SELECT role, content FROM conversations WHERE session_id=$1 AND client_id=$2 ORDER BY recorded_at ASC',
+    [sessionId, clientId]
+  );
+  const assign = await pool.query(
+    'SELECT assignment_text FROM assignments WHERE session_id=$1 AND client_id=$2 ORDER BY created_at DESC LIMIT 1',
+    [sessionId, clientId]
+  );
+  const affects = await pool.query(
+    'SELECT phase, total FROM affect_measurements WHERE session_id=$1 AND client_id=$2 ORDER BY recorded_at ASC',
+    [sessionId, clientId]
+  );
+  const masking = await pool.query(
+    'SELECT masking_load FROM masking_scores WHERE session_id=$1 AND client_id=$2 ORDER BY recorded_at DESC LIMIT 1',
+    [sessionId, clientId]
+  );
+  const needs = await pool.query(
+    'SELECT volition_index FROM need_scores WHERE session_id=$1 AND client_id=$2 ORDER BY recorded_at DESC LIMIT 1',
+    [sessionId, clientId]
+  );
+
+  const transcriptText = convos.rows.map(r => (r.role === 'user' ? 'PERSON: ' : 'GUIDE: ') + r.content).join('\n');
+  const assignmentGiven = assign.rows[0]?.assignment_text || null;
+  const affectBefore = affects.rows.find(a => a.phase === 'before')?.total || null;
+  const affectAfter = affects.rows.find(a => a.phase === 'after')?.total || null;
+  const maskingLoad = masking.rows[0]?.masking_load ?? null;
+  const volitionIndex = needs.rows[0]?.volition_index || null;
+
+  // Generate compressed summary
+  const summaryPrompt = `You are summarising a therapeutic session for a persistent memory system.
+The summary must be under 150 tokens and capture only structural essentials.
+Format exactly as:
+THEME: [one sentence — the emotional/psychological core of what the person was crossing today]
+MOVEMENT: [one sentence — what shifted, if anything, during the session]
+ASSIGNMENT: [the assignment given, or "none"]
+FLAGS: [any risk signals — or "none"]
+PATTERNS: [any recurring patterns visible — or "none"]
+
+SESSION TRANSCRIPT:
+${transcriptText.slice(0, 4000)}`;
+
+  const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 200, messages: [{ role: 'user', content: summaryPrompt }] })
+  });
+  const aiData = await aiRes.json();
+  if (aiData.error) throw new Error('AI error: ' + aiData.error.message);
+  const summary = aiData.content?.[0]?.text?.trim() || null;
+
+  await pool.query(
+    `INSERT INTO session_archives
+       (client_id, session_id, session_number, compressed_summary, raw_transcript_length,
+        assignment_given, affect_before, affect_after, masking_load, volition_index)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+    [clientId, sessionId, s.session_number, summary, convos.rows.length,
+     assignmentGiven, affectBefore, affectAfter, maskingLoad, volitionIndex]
+  );
+
+  return summary;
+}
+
+async function updatePersistentProfile(clientId, sessionId, latestSummary) {
+  // Gather all session archives for this client (up to 10 most recent)
+  const archives = await pool.query(
+    `SELECT * FROM session_archives WHERE client_id=$1 ORDER BY archived_at DESC LIMIT 10`,
+    [clientId]
+  );
+  const latestNeeds = await pool.query(
+    `SELECT seen, cheered, aimed, guided, volition_index FROM need_scores
+     WHERE client_id=$1 ORDER BY recorded_at DESC LIMIT 1`, [clientId]
+  );
+  const latestAssign = await pool.query(
+    `SELECT assignment_text FROM assignments WHERE client_id=$1 ORDER BY created_at DESC LIMIT 1`, [clientId]
+  );
+  const maskingHistory = await pool.query(
+    `SELECT masking_load, recorded_at FROM masking_scores WHERE client_id=$1 ORDER BY recorded_at DESC LIMIT 5`, [clientId]
+  );
+  const sessionCount = await pool.query(
+    `SELECT COUNT(*) FROM sessions WHERE client_id=$1`, [clientId]
+  );
+
+  const archiveSummaries = archives.rows.map((a, i) =>
+    `Session ${a.session_number || (archives.rows.length - i)}: ${a.compressed_summary || '(no summary)'}`
+  ).join('\n');
+
+  const needs = latestNeeds.rows[0] || {};
+  const maskingTrend = maskingHistory.rows.map(m => m.masking_load);
+
+  const profilePrompt = `You are updating a persistent client profile for a therapeutic memory system.
+Based on the session history below, extract a structured profile.
+Respond ONLY in this exact JSON format with no preamble or markdown:
+{
+  "active_patterns": ["pattern 1", "pattern 2", "pattern 3"],
+  "risk_flags": ["flag 1"] or [],
+  "next_priorities": ["priority 1", "priority 2", "priority 3"],
+  "hypothesis_label": "one brief phrase describing what this person is crossing"
+}
+
+Rules:
+- active_patterns: maximum 3, each under 15 words, grounded in the transcripts
+- risk_flags: only genuine concern signals — isolation, despair, harm, crisis — leave empty if none
+- next_priorities: what the next session should address, in order
+- hypothesis_label: a single poetic phrase like "learning to exist without apology" or "crossing from performed strength to felt safety"
+
+SESSION HISTORY (most recent first):
+${archiveSummaries}`;
+
+  const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 400, messages: [{ role: 'user', content: profilePrompt }] })
+  });
+  const aiData = await aiRes.json();
+  if (aiData.error) throw new Error('AI error: ' + aiData.error.message);
+
+  let profileData = { active_patterns: [], risk_flags: [], next_priorities: [], hypothesis_label: null };
+  try {
+    const raw = aiData.content?.[0]?.text?.trim() || '{}';
+    profileData = JSON.parse(raw.replace(/```json|```/g, '').trim());
+  } catch (e) {
+    console.error('[updatePersistentProfile] JSON parse failed, using defaults:', e.message);
+  }
+
+  await pool.query(
+    `INSERT INTO persistent_profiles
+       (client_id, volition_index, seen_score, cheered_score, aimed_score, guided_score,
+        masking_trend, active_patterns, risk_flags, next_priorities,
+        last_assignment, last_assignment_status, session_count, last_session_summary,
+        profile_staleness, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',$12,$13,FALSE,NOW())
+     ON CONFLICT (client_id) DO UPDATE SET
+       volition_index=$2, seen_score=$3, cheered_score=$4, aimed_score=$5, guided_score=$6,
+       masking_trend=$7, active_patterns=$8, risk_flags=$9, next_priorities=$10,
+       last_assignment=$11, session_count=$12, last_session_summary=$13,
+       profile_staleness=FALSE, updated_at=NOW()`,
+    [
+      clientId,
+      needs.volition_index || null, needs.seen || null, needs.cheered || null,
+      needs.aimed || null, needs.guided || null,
+      JSON.stringify(maskingTrend),
+      JSON.stringify(profileData.active_patterns || []),
+      JSON.stringify(profileData.risk_flags || []),
+      JSON.stringify(profileData.next_priorities || []),
+      latestAssign.rows[0]?.assignment_text || null,
+      parseInt(sessionCount.rows[0].count),
+      latestSummary || null
+    ]
+  );
+}
+
+async function detectSovereignMoments(clientId, sessionId) {
+  const convos = await pool.query(
+    'SELECT role, content FROM conversations WHERE session_id=$1 AND client_id=$2 ORDER BY recorded_at ASC',
+    [sessionId, clientId]
+  );
+  if (convos.rows.length < 4) return; // Not enough conversation for detection
+
+  const transcriptText = convos.rows.map((r, i) =>
+    `[${i+1}] ${r.role === 'user' ? 'PERSON' : 'GUIDE'}: ${r.content}`
+  ).join('\n');
+
+  const detectionPrompt = `You are detecting sovereign moments in a therapeutic conversation.
+A sovereign moment is when the person explicitly reframes, corrects, or refuses the Guide's framing using their own language — asserting their own understanding over the offered interpretation.
+
+Examples of sovereign moments:
+- Guide says "It sounds like you wanted to be seen" / Person says "No — it wasn't about being seen, it was about being believed"
+- Guide says "That sounds like grief" / Person says "It's not grief. It's fury."
+- Guide offers a reflection / Person says "Actually, I think what's really happening is..."
+
+NOT sovereign moments:
+- Simple agreement ("yes", "exactly", "that's right")
+- New information added without correction
+- Changing the subject
+
+Respond ONLY in JSON, no preamble:
+{
+  "tier1": ["exact quote of the person's sovereign statement"],
+  "tier2": ["flagged but uncertain — exact quote"],
+  "tier1_count": number,
+  "tier2_count": number
+}
+
+TRANSCRIPT:
+${transcriptText.slice(0, 5000)}`;
+
+  const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 600, messages: [{ role: 'user', content: detectionPrompt }] })
+  });
+  const aiData = await aiRes.json();
+  if (aiData.error) throw new Error('AI error: ' + aiData.error.message);
+
+  let detected = { tier1: [], tier2: [] };
+  try {
+    const raw = aiData.content?.[0]?.text?.trim() || '{}';
+    detected = JSON.parse(raw.replace(/```json|```/g, '').trim());
+  } catch (e) {
+    console.error('[detectSovereignMoments] JSON parse failed:', e.message);
+    return;
+  }
+
+  // Auto-save Tier 1 (confirmed)
+  for (const moment of (detected.tier1 || [])) {
+    if (moment && moment.length > 5) {
+      await pool.query(
+        `INSERT INTO sovereign_moments (client_id, session_id, moment_text, detection_tier, confirmed)
+         VALUES ($1,$2,$3,1,TRUE)`,
+        [clientId, sessionId, moment.slice(0, 500)]
+      );
+    }
+  }
+
+  // Save Tier 2 (flagged for practitioner review)
+  for (const moment of (detected.tier2 || [])) {
+    if (moment && moment.length > 5) {
+      await pool.query(
+        `INSERT INTO sovereign_moments (client_id, session_id, moment_text, detection_tier, confirmed)
+         VALUES ($1,$2,$3,2,FALSE)`,
+        [clientId, sessionId, moment.slice(0, 500)]
+      );
+    }
+  }
+
+  console.log('[detectSovereignMoments] tier1:', detected.tier1?.length || 0, 'tier2:', detected.tier2?.length || 0);
+}
+
+// Practitioner: view sovereign moments for a client
+app.get('/practitioner/client/:id/sovereign-moments', practAuth, async (req, res) => {
+  try {
+    const moments = await pool.query(
+      'SELECT * FROM sovereign_moments WHERE client_id=$1 ORDER BY detected_at DESC',
+      [req.params.id]
+    );
+    res.json(moments.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Practitioner: confirm or dismiss a sovereign moment
+app.patch('/practitioner/sovereign-moments/:id', practAuth, async (req, res) => {
+  const { action, note } = req.body; // action: 'confirm' | 'dismiss'
+  try {
+    if (action === 'confirm') {
+      await pool.query(
+        'UPDATE sovereign_moments SET confirmed=TRUE, dismissed=FALSE, practitioner_note=$1 WHERE id=$2',
+        [note || null, req.params.id]
+      );
+    } else if (action === 'dismiss') {
+      await pool.query(
+        'UPDATE sovereign_moments SET dismissed=TRUE, confirmed=FALSE, practitioner_note=$1 WHERE id=$2',
+        [note || null, req.params.id]
+      );
+    }
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Explicit Phase 1 table creation — call once if initDB migration didn't run
+app.post('/practitioner/create-phase1-tables', practAuth, async (req, res) => {
+  const results = [];
+  const tables = [
+    {
+      name: 'persistent_profiles',
+      sql: `CREATE TABLE IF NOT EXISTS persistent_profiles (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE UNIQUE,
+        volition_index INTEGER,
+        seen_score INTEGER, cheered_score INTEGER, aimed_score INTEGER, guided_score INTEGER,
+        masking_trend JSONB DEFAULT '[]',
+        active_patterns JSONB DEFAULT '[]',
+        risk_flags JSONB DEFAULT '[]',
+        next_priorities JSONB DEFAULT '[]',
+        last_assignment TEXT,
+        last_assignment_status TEXT DEFAULT 'pending',
+        session_count INTEGER DEFAULT 0,
+        last_session_summary TEXT,
+        profile_staleness BOOLEAN DEFAULT FALSE,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )`
+    },
+    {
+      name: 'session_archives',
+      sql: `CREATE TABLE IF NOT EXISTS session_archives (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER,
+        session_number INTEGER,
+        compressed_summary TEXT,
+        raw_transcript_length INTEGER,
+        assignment_given TEXT,
+        affect_before INTEGER,
+        affect_after INTEGER,
+        masking_load INTEGER,
+        volition_index INTEGER,
+        archived_at TIMESTAMPTZ DEFAULT NOW()
+      )`
+    },
+    {
+      name: 'session_architectures',
+      sql: `CREATE TABLE IF NOT EXISTS session_architectures (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER,
+        movement_priorities JSONB,
+        risk_flags JSONB DEFAULT '[]',
+        opening_question TEXT,
+        hypothesis_label TEXT,
+        override_conditions TEXT,
+        generated_at TIMESTAMPTZ DEFAULT NOW()
+      )`
+    },
+    {
+      name: 'sovereign_moments',
+      sql: `CREATE TABLE IF NOT EXISTS sovereign_moments (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER,
+        moment_text TEXT NOT NULL,
+        detection_tier INTEGER DEFAULT 2,
+        confirmed BOOLEAN DEFAULT FALSE,
+        dismissed BOOLEAN DEFAULT FALSE,
+        practitioner_note TEXT,
+        detected_at TIMESTAMPTZ DEFAULT NOW()
+      )`
+    }
+  ];
+
+  for (const t of tables) {
+    try {
+      await pool.query(t.sql);
+      results.push({ table: t.name, status: 'ok' });
+    } catch (err) {
+      results.push({ table: t.name, status: 'error', error: err.message });
+    }
+  }
+
+  const allOk = results.every(r => r.status === 'ok');
+  res.json({ ok: allOk, results });
+});
+
+// One-time migration: generate persistent profiles from existing session data
+app.post('/practitioner/migrate-profiles', practAuth, async (req, res) => {
+  try {
+    const clients = await pool.query('SELECT id FROM clients');
+    res.json({ ok: true, queued: clients.rows.length });
+
+    for (const c of clients.rows) {
+      try {
+        // Get most recent completed session
+        const sess = await pool.query(
+          'SELECT id FROM sessions WHERE client_id=$1 AND ended_at IS NOT NULL ORDER BY started_at DESC LIMIT 1',
+          [c.id]
+        );
+        if (!sess.rows.length) continue;
+        const sessionId = sess.rows[0].id;
+
+        // Check if archive already exists
+        const existing = await pool.query(
+          'SELECT id FROM session_archives WHERE client_id=$1 AND session_id=$2', [c.id, sessionId]
+        );
+        if (!existing.rows.length) {
+          await buildSessionArchive(c.id, sessionId).catch(err =>
+            console.error('[migrate] archive failed for client', c.id, ':', err.message)
+          );
+        }
+
+        await updatePersistentProfile(c.id, sessionId, null).catch(err =>
+          console.error('[migrate] profile failed for client', c.id, ':', err.message)
+        );
+
+        console.log('[migrate] completed client', c.id);
+        // Rate limit: don't hammer API
+        await new Promise(r => setTimeout(r, 2000));
+      } catch (err) {
+        console.error('[migrate] error for client', c.id, ':', err.message);
+      }
+    }
+    console.log('[migrate] all clients processed');
+  } catch (err) { console.error('[migrate] fatal:', err.message); }
 });
 
 initDB().then(() => {
