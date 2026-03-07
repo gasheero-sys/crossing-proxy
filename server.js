@@ -632,10 +632,17 @@ app.get('/practitioner/client/:id', practAuth, async (req, res) => {
     const analysis = await pool.query('SELECT * FROM sva_analysis WHERE client_id=$1 ORDER BY created_at DESC LIMIT 1', [id]);
     const arcReading = await pool.query('SELECT * FROM arc_readings WHERE client_id=$1 ORDER BY generated_at DESC LIMIT 1', [id]);
     const arcResult = arcReading.rows[0] ? { ...arcReading.rows[0].result, generated_at: arcReading.rows[0].generated_at } : null;
+    // Phase 1 data
+    const persistentProfile = await pool.query('SELECT * FROM persistent_profiles WHERE client_id=$1', [id]);
+    const sovereignMoments  = await pool.query('SELECT * FROM sovereign_moments WHERE client_id=$1 ORDER BY detected_at DESC', [id]);
+    const sessionArchives   = await pool.query('SELECT * FROM session_archives WHERE client_id=$1 ORDER BY archived_at DESC', [id]);
     res.json({ client: client.rows[0], sessions: sessions.rows, story: story.rows,
       needHistory: needs.rows, affectHistory: affect.rows, assignments: assigns.rows,
       ecosystem: eco.rows, conversations: convos.rows, svaAnalysis: analysis.rows[0] || null,
-      arcReading: arcResult });
+      arcReading: arcResult,
+      persistentProfile: persistentProfile.rows[0] || null,
+      sovereignMoments: sovereignMoments.rows,
+      sessionArchives: sessionArchives.rows });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1393,6 +1400,89 @@ app.patch('/practitioner/sovereign-moments/:id', practAuth, async (req, res) => 
     }
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Explicit Phase 1 table creation — call once if initDB migration didn't run
+app.post('/practitioner/create-phase1-tables', practAuth, async (req, res) => {
+  const results = [];
+  const tables = [
+    {
+      name: 'persistent_profiles',
+      sql: `CREATE TABLE IF NOT EXISTS persistent_profiles (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE UNIQUE,
+        volition_index INTEGER,
+        seen_score INTEGER, cheered_score INTEGER, aimed_score INTEGER, guided_score INTEGER,
+        masking_trend JSONB DEFAULT '[]',
+        active_patterns JSONB DEFAULT '[]',
+        risk_flags JSONB DEFAULT '[]',
+        next_priorities JSONB DEFAULT '[]',
+        last_assignment TEXT,
+        last_assignment_status TEXT DEFAULT 'pending',
+        session_count INTEGER DEFAULT 0,
+        last_session_summary TEXT,
+        profile_staleness BOOLEAN DEFAULT FALSE,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )`
+    },
+    {
+      name: 'session_archives',
+      sql: `CREATE TABLE IF NOT EXISTS session_archives (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER,
+        session_number INTEGER,
+        compressed_summary TEXT,
+        raw_transcript_length INTEGER,
+        assignment_given TEXT,
+        affect_before INTEGER,
+        affect_after INTEGER,
+        masking_load INTEGER,
+        volition_index INTEGER,
+        archived_at TIMESTAMPTZ DEFAULT NOW()
+      )`
+    },
+    {
+      name: 'session_architectures',
+      sql: `CREATE TABLE IF NOT EXISTS session_architectures (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER,
+        movement_priorities JSONB,
+        risk_flags JSONB DEFAULT '[]',
+        opening_question TEXT,
+        hypothesis_label TEXT,
+        override_conditions TEXT,
+        generated_at TIMESTAMPTZ DEFAULT NOW()
+      )`
+    },
+    {
+      name: 'sovereign_moments',
+      sql: `CREATE TABLE IF NOT EXISTS sovereign_moments (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+        session_id INTEGER,
+        moment_text TEXT NOT NULL,
+        detection_tier INTEGER DEFAULT 2,
+        confirmed BOOLEAN DEFAULT FALSE,
+        dismissed BOOLEAN DEFAULT FALSE,
+        practitioner_note TEXT,
+        detected_at TIMESTAMPTZ DEFAULT NOW()
+      )`
+    }
+  ];
+
+  for (const t of tables) {
+    try {
+      await pool.query(t.sql);
+      results.push({ table: t.name, status: 'ok' });
+    } catch (err) {
+      results.push({ table: t.name, status: 'error', error: err.message });
+    }
+  }
+
+  const allOk = results.every(r => r.status === 'ok');
+  res.json({ ok: allOk, results });
 });
 
 // One-time migration: generate persistent profiles from existing session data
