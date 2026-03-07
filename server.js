@@ -1148,14 +1148,44 @@ async function buildSessionArchive(clientId, sessionId) {
     'SELECT role, content FROM conversations WHERE session_id=$1 AND client_id=$2 ORDER BY recorded_at ASC',
     [sessionId, clientId]
   );
-  const assign = await pool.query(
+
+  // Assignment: try session_id match first, then fall back to most recent within 2 hours of session start
+  let assign = await pool.query(
     'SELECT assignment_text FROM assignments WHERE session_id=$1 AND client_id=$2 ORDER BY created_at DESC LIMIT 1',
     [sessionId, clientId]
   );
-  const affects = await pool.query(
-    'SELECT phase, total FROM affect_measurements WHERE session_id=$1 AND client_id=$2 ORDER BY recorded_at ASC',
+  if (!assign.rows.length) {
+    assign = await pool.query(
+      `SELECT assignment_text FROM assignments
+       WHERE client_id=$1
+         AND created_at >= $2::timestamptz - interval '2 hours'
+       ORDER BY created_at DESC LIMIT 1`,
+      [clientId, s.started_at]
+    );
+  }
+  // Final fallback: most recent assignment for this client at all
+  if (!assign.rows.length) {
+    assign = await pool.query(
+      'SELECT assignment_text FROM assignments WHERE client_id=$1 ORDER BY created_at DESC LIMIT 1',
+      [clientId]
+    );
+  }
+
+  // Affect: try session_id first, then fall back to time window
+  let affects = await pool.query(
+    'SELECT phase, total, q1, q2, q3, q4, q5 FROM affect_measurements WHERE session_id=$1 AND client_id=$2 ORDER BY recorded_at ASC',
     [sessionId, clientId]
   );
+  if (!affects.rows.length) {
+    affects = await pool.query(
+      `SELECT phase, total, q1, q2, q3, q4, q5 FROM affect_measurements
+       WHERE client_id=$1
+         AND recorded_at >= $2::timestamptz - interval '2 hours'
+       ORDER BY recorded_at ASC`,
+      [clientId, s.started_at]
+    );
+  }
+
   const masking = await pool.query(
     'SELECT masking_load FROM masking_scores WHERE session_id=$1 AND client_id=$2 ORDER BY recorded_at DESC LIMIT 1',
     [sessionId, clientId]
@@ -1167,20 +1197,31 @@ async function buildSessionArchive(clientId, sessionId) {
 
   const transcriptText = convos.rows.map(r => (r.role === 'user' ? 'PERSON: ' : 'GUIDE: ') + r.content).join('\n');
   const assignmentGiven = assign.rows[0]?.assignment_text || null;
-  const affectBefore = affects.rows.find(a => a.phase === 'before')?.total || null;
-  const affectAfter = affects.rows.find(a => a.phase === 'after')?.total || null;
-  const maskingLoad = masking.rows[0]?.masking_load ?? null;
+  const affectBefore = affects.rows.find(a => a.phase === 'before')?.total ?? null;
+  const affectAfter  = affects.rows.find(a => a.phase === 'after')?.total ?? null;
+  const maskingLoad  = masking.rows[0]?.masking_load ?? null;
   const volitionIndex = needs.rows[0]?.volition_index || null;
 
-  // Generate compressed summary
+  // Calculate percentage shift for display (max possible shift = 25, min = -25)
+  let affectShiftPct = null;
+  if (affectBefore !== null && affectAfter !== null) {
+    affectShiftPct = Math.round(((affectAfter - affectBefore) / 25) * 100);
+  }
+
+  // Generate compressed summary — include actual assignment text so AI doesn't say "none"
   const summaryPrompt = `You are summarising a therapeutic session for a persistent memory system.
-The summary must be under 150 tokens and capture only structural essentials.
+The summary must be under 200 tokens and capture only structural essentials.
 Format exactly as:
 THEME: [one sentence — the emotional/psychological core of what the person was crossing today]
-MOVEMENT: [one sentence — what shifted, if anything, during the session]
-ASSIGNMENT: [the assignment given, or "none"]
+MOVEMENT: [one sentence — what actually shifted in this session, with honest weight. Do not default to "slight." A self-renaming, a lifted head, a new frame for one's life — these are significant movements even if quiet. Name what moved and how much.]
+ASSIGNMENT: [the exact assignment given below, compressed to one sentence — do not write "none" if an assignment is provided]
 FLAGS: [any risk signals — or "none"]
 PATTERNS: [any recurring patterns visible — or "none"]
+
+Calibration note on MOVEMENT: "Slight" should only be used if genuinely nothing shifted. If the person named themselves, reached toward something, or showed any change in volitional capacity, that is moderate-to-significant movement. Match the weight of the movement to the evidence.
+
+ASSIGNMENT GIVEN THIS SESSION:
+${assignmentGiven || 'No assignment was given this session.'}
 
 SESSION TRANSCRIPT:
 ${transcriptText.slice(0, 4000)}`;
@@ -1188,7 +1229,7 @@ ${transcriptText.slice(0, 4000)}`;
   const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 200, messages: [{ role: 'user', content: summaryPrompt }] })
+    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 250, messages: [{ role: 'user', content: summaryPrompt }] })
   });
   const aiData = await aiRes.json();
   if (aiData.error) throw new Error('AI error: ' + aiData.error.message);
@@ -1207,7 +1248,6 @@ ${transcriptText.slice(0, 4000)}`;
 }
 
 async function updatePersistentProfile(clientId, sessionId, latestSummary) {
-  // Gather all session archives for this client (up to 10 most recent)
   const archives = await pool.query(
     `SELECT * FROM session_archives WHERE client_id=$1 ORDER BY archived_at DESC LIMIT 10`,
     [clientId]
@@ -1225,6 +1265,10 @@ async function updatePersistentProfile(clientId, sessionId, latestSummary) {
   const sessionCount = await pool.query(
     `SELECT COUNT(*) FROM sessions WHERE client_id=$1`, [clientId]
   );
+  // Phase 1: include ecosystem data in profile generation
+  const ecosystem = await pool.query(
+    `SELECT person_name, person_type, needs_provided FROM ecosystem WHERE client_id=$1`, [clientId]
+  );
 
   const archiveSummaries = archives.rows.map((a, i) =>
     `Session ${a.session_number || (archives.rows.length - i)}: ${a.compressed_summary || '(no summary)'}`
@@ -1233,8 +1277,16 @@ async function updatePersistentProfile(clientId, sessionId, latestSummary) {
   const needs = latestNeeds.rows[0] || {};
   const maskingTrend = maskingHistory.rows.map(m => m.masking_load);
 
+  // Build ecosystem context — single node is a critical structural signal
+  const ecoNodes = ecosystem.rows;
+  const ecoText = ecoNodes.length === 0
+    ? 'ECOSYSTEM: Empty — no support relationships mapped.'
+    : ecoNodes.length === 1
+      ? `ECOSYSTEM: Single node — "${ecoNodes[0].person_name}" (${ecoNodes[0].person_type}) carries all mapped needs. This is structurally precarious. Expanding this network is a clinical priority.`
+      : `ECOSYSTEM: ${ecoNodes.map(e => `${e.person_name} (${e.person_type}, needs: ${(e.needs_provided||[]).join(', ')||'none'})`).join('; ')}`;
+
   const profilePrompt = `You are updating a persistent client profile for a therapeutic memory system.
-Based on the session history below, extract a structured profile.
+Based on the session history and ecosystem data below, extract a structured profile.
 Respond ONLY in this exact JSON format with no preamble or markdown:
 {
   "active_patterns": ["pattern 1", "pattern 2", "pattern 3"],
@@ -1243,11 +1295,34 @@ Respond ONLY in this exact JSON format with no preamble or markdown:
   "hypothesis_label": "one brief phrase describing what this person is crossing"
 }
 
-Rules:
-- active_patterns: maximum 3, each under 15 words, grounded in the transcripts
-- risk_flags: only genuine concern signals — isolation, despair, harm, crisis — leave empty if none
-- next_priorities: what the next session should address, in order
-- hypothesis_label: a single poetic phrase like "learning to exist without apology" or "crossing from performed strength to felt safety"
+Rules for active_patterns:
+- Maximum 3, each under 20 words
+- Must be grounded in specific evidence from the session transcripts
+- Describe what the person DOES or the structure of their experience — not an interpretation of why
+- Do NOT characterise resistance or avoidance unless the transcript directly evidences it
+- If a person pushes back on a frame, this may be epistemological precision, not avoidance — describe it as such
+
+Rules for risk_flags:
+- Only genuine clinical concern: isolation, despair, harm ideation, crisis
+- Leave empty if none present
+- A single-node ecosystem is a structural concern, not a crisis risk — note it in priorities, not flags
+
+Rules for next_priorities:
+- Maximum 4 priorities (not 3 — allow space for structural interventions)
+- Priority 1 must address the most structurally urgent item, not the most emotionally available one
+- IF the ecosystem has only one node: the FIRST or SECOND priority must name the person in that node and explore expanding the relationship or the network
+- Each priority must be specific and actionable — name what to do, not just what to explore
+- Later priorities (3, 4) may address deeper psychological terrain
+
+Rules for hypothesis_label:
+- A single poetic phrase: "learning to exist without apology", "crossing from performed strength to felt safety"
+
+${ecoText}
+
+FOUR NEEDS (latest):
+Seen=${needs.seen||0}, Cheered=${needs.cheered||0}, Aimed=${needs.aimed||0}, Guided=${needs.guided||0}
+${needs.aimed < 30 ? 'NOTE: Aimed is critically low (' + needs.aimed + '/100) — the person has no authored direction. Building aim is a structural priority.' : ''}
+${needs.seen < 30 ? 'NOTE: Seen is critically low (' + needs.seen + '/100) — the person is not feeling witnessed. Being seen is the most basic need.' : ''}
 
 SESSION HISTORY (most recent first):
 ${archiveSummaries}`;
@@ -1255,7 +1330,7 @@ ${archiveSummaries}`;
   const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 400, messages: [{ role: 'user', content: profilePrompt }] })
+    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 600, messages: [{ role: 'user', content: profilePrompt }] })
   });
   const aiData = await aiRes.json();
   if (aiData.error) throw new Error('AI error: ' + aiData.error.message);
@@ -1300,40 +1375,64 @@ async function detectSovereignMoments(clientId, sessionId) {
     'SELECT role, content FROM conversations WHERE session_id=$1 AND client_id=$2 ORDER BY recorded_at ASC',
     [sessionId, clientId]
   );
-  if (convos.rows.length < 4) return; // Not enough conversation for detection
+  if (convos.rows.length < 4) return;
 
   const transcriptText = convos.rows.map((r, i) =>
     `[${i+1}] ${r.role === 'user' ? 'PERSON' : 'GUIDE'}: ${r.content}`
   ).join('\n');
 
   const detectionPrompt = `You are detecting sovereign moments in a therapeutic conversation.
-A sovereign moment is when the person explicitly reframes, corrects, or refuses the Guide's framing using their own language — asserting their own understanding over the offered interpretation.
 
-Examples of sovereign moments:
-- Guide says "It sounds like you wanted to be seen" / Person says "No — it wasn't about being seen, it was about being believed"
-- Guide says "That sounds like grief" / Person says "It's not grief. It's fury."
-- Guide offers a reflection / Person says "Actually, I think what's really happening is..."
+A SOVEREIGN MOMENT is any instance where the person asserts their own voice, framing, or self-understanding — particularly in response to or contrast with what the Guide has offered. There are four types:
+
+TYPE 1 — EXPLICIT CORRECTION: Person directly refuses or corrects the Guide's framing.
+Examples:
+- Guide says "It sounds like grief" / Person says "No — it's not grief, it's fury"
+- Guide offers a metaphor / Person says "That's not quite it — what it actually is..."
+- Guide reflects something back / Person says "Actually, I think..."
+
+TYPE 2 — SELF-NAMING: Person authors their own description, identity, or self-understanding — especially when it is precise, unexpected, or goes beyond what the Guide offered.
+Examples:
+- "I am the seer whose task is coming to an end well" (self-named, not assigned)
+- "I am not someone who gives up — I am someone who goes quiet"
+- Any moment of self-description using language the person generated, not the Guide
+
+TYPE 3 — CHOOSING / REACHING: Person makes an explicit volitional choice or reaches toward something — not passive reception, but active authorship of direction.
+Examples:
+- "We find together, I like that" (choosing collaboration, not just accepting it)
+- "Yes — I want to try that"
+- "My head is lifted up now and I will see it when it comes" (authored orientation)
+
+TYPE 4 — OWNERSHIP: Person explicitly claims or confirms their own act, naming, or insight.
+Examples:
+- "Yes. I did." (in response to being told they named themselves)
+- "That is mine — I said that"
+- Any explicit claiming of an act or insight as their own
+
+TIER ASSIGNMENT:
+- Tier 1 (auto-confirm): Types 1, 2, 3, 4 when the sovereign act is clear and unambiguous from the text
+- Tier 2 (flag for review): Moments that may be sovereign but are ambiguous or brief
 
 NOT sovereign moments:
-- Simple agreement ("yes", "exactly", "that's right")
-- New information added without correction
-- Changing the subject
+- Simple agreement ("yes", "that's right", "exactly") with no added authorship
+- New information added without any self-assertion
+- Emotional responses (crying, sighing) without a voiced claim
 
-Respond ONLY in JSON, no preamble:
+BE GENEROUS. It is better to flag too many than to miss a genuine moment of self-authorship. A person's sovereign moments are the markers of their crossing — missing them means their trail goes blank.
+
+Respond ONLY in valid JSON, no preamble, no markdown:
 {
-  "tier1": ["exact quote of the person's sovereign statement"],
-  "tier2": ["flagged but uncertain — exact quote"],
-  "tier1_count": number,
-  "tier2_count": number
+  "tier1": [{"text": "exact quote from person", "type": "TYPE 1|2|3|4", "note": "brief reason"}],
+  "tier2": [{"text": "exact quote from person", "type": "TYPE 1|2|3|4", "note": "brief reason"}]
 }
 
 TRANSCRIPT:
-${transcriptText.slice(0, 5000)}`;
+${transcriptText.slice(0, 6000)}`;
 
   const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 600, messages: [{ role: 'user', content: detectionPrompt }] })
+    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 1000, messages: [{ role: 'user', content: detectionPrompt }] })
   });
   const aiData = await aiRes.json();
   if (aiData.error) throw new Error('AI error: ' + aiData.error.message);
@@ -1349,22 +1448,26 @@ ${transcriptText.slice(0, 5000)}`;
 
   // Auto-save Tier 1 (confirmed)
   for (const moment of (detected.tier1 || [])) {
-    if (moment && moment.length > 5) {
+    const text = typeof moment === 'string' ? moment : moment.text;
+    const note = typeof moment === 'object' ? (moment.type + (moment.note ? ' — ' + moment.note : '')) : null;
+    if (text && text.length > 3) {
       await pool.query(
-        `INSERT INTO sovereign_moments (client_id, session_id, moment_text, detection_tier, confirmed)
-         VALUES ($1,$2,$3,1,TRUE)`,
-        [clientId, sessionId, moment.slice(0, 500)]
+        `INSERT INTO sovereign_moments (client_id, session_id, moment_text, detection_tier, confirmed, practitioner_note)
+         VALUES ($1,$2,$3,1,TRUE,$4)`,
+        [clientId, sessionId, text.slice(0, 500), note]
       );
     }
   }
 
   // Save Tier 2 (flagged for practitioner review)
   for (const moment of (detected.tier2 || [])) {
-    if (moment && moment.length > 5) {
+    const text = typeof moment === 'string' ? moment : moment.text;
+    const note = typeof moment === 'object' ? (moment.type + (moment.note ? ' — ' + moment.note : '')) : null;
+    if (text && text.length > 3) {
       await pool.query(
-        `INSERT INTO sovereign_moments (client_id, session_id, moment_text, detection_tier, confirmed)
-         VALUES ($1,$2,$3,2,FALSE)`,
-        [clientId, sessionId, moment.slice(0, 500)]
+        `INSERT INTO sovereign_moments (client_id, session_id, moment_text, detection_tier, confirmed, practitioner_note)
+         VALUES ($1,$2,$3,2,FALSE,$4)`,
+        [clientId, sessionId, text.slice(0, 500), note]
       );
     }
   }
@@ -1487,9 +1590,10 @@ app.post('/practitioner/create-phase1-tables', practAuth, async (req, res) => {
 
 // One-time migration: generate persistent profiles from existing session data
 app.post('/practitioner/migrate-profiles', practAuth, async (req, res) => {
+  const force = req.body && req.body.force === true; // force=true regenerates existing archives
   try {
     const clients = await pool.query('SELECT id FROM clients');
-    res.json({ ok: true, queued: clients.rows.length });
+    res.json({ ok: true, queued: clients.rows.length, force });
 
     for (const c of clients.rows) {
       try {
@@ -1501,22 +1605,30 @@ app.post('/practitioner/migrate-profiles', practAuth, async (req, res) => {
         if (!sess.rows.length) continue;
         const sessionId = sess.rows[0].id;
 
-        // Check if archive already exists
+        // Check if archive already exists — skip unless force=true
         const existing = await pool.query(
           'SELECT id FROM session_archives WHERE client_id=$1 AND session_id=$2', [c.id, sessionId]
         );
-        if (!existing.rows.length) {
-          await buildSessionArchive(c.id, sessionId).catch(err =>
-            console.error('[migrate] archive failed for client', c.id, ':', err.message)
+        if (existing.rows.length && !force) {
+          // Archive exists and not forcing — still update profile in case it changed
+          await updatePersistentProfile(c.id, sessionId, null).catch(err =>
+            console.error('[migrate] profile failed for client', c.id, ':', err.message)
+          );
+        } else {
+          // Delete existing archive if force, then rebuild
+          if (existing.rows.length && force) {
+            await pool.query('DELETE FROM session_archives WHERE client_id=$1 AND session_id=$2', [c.id, sessionId]);
+          }
+          const summary = await buildSessionArchive(c.id, sessionId).catch(err => {
+            console.error('[migrate] archive failed for client', c.id, ':', err.message);
+            return null;
+          });
+          await updatePersistentProfile(c.id, sessionId, summary).catch(err =>
+            console.error('[migrate] profile failed for client', c.id, ':', err.message)
           );
         }
 
-        await updatePersistentProfile(c.id, sessionId, null).catch(err =>
-          console.error('[migrate] profile failed for client', c.id, ':', err.message)
-        );
-
         console.log('[migrate] completed client', c.id);
-        // Rate limit: don't hammer API
         await new Promise(r => setTimeout(r, 2000));
       } catch (err) {
         console.error('[migrate] error for client', c.id, ':', err.message);
