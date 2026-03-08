@@ -1197,15 +1197,40 @@ async function buildSessionArchive(clientId, sessionId) {
 
   const transcriptText = convos.rows.map(r => (r.role === 'user' ? 'PERSON: ' : 'GUIDE: ') + r.content).join('\n');
   const assignmentGiven = assign.rows[0]?.assignment_text || null;
-  const affectBefore = affects.rows.find(a => a.phase === 'before')?.total ?? null;
-  const affectAfter  = affects.rows.find(a => a.phase === 'after')?.total ?? null;
+  const befRow = affects.rows.find(a => a.phase === 'before') || null;
+  const aftRow = affects.rows.find(a => a.phase === 'after') || null;
+  // Store raw totals for legacy compatibility
+  const affectBefore = befRow?.total ?? null;
+  const affectAfter  = aftRow?.total ?? null;
   const maskingLoad  = masking.rows[0]?.masking_load ?? null;
   const volitionIndex = needs.rows[0]?.volition_index || null;
 
-  // Calculate percentage shift for display (max possible shift = 25, min = -25)
+  // Correct volitional shift formula:
+  // q1 (heaviness) and q2 (aloneness): improvement = before - after (lower is better)
+  // q3 (clarity), q4 (hope), q5 (seen): improvement = after - before (higher is better)
+  // Shift % = sum of gains / max possible gains * 100
+  // Max possible = 5 points per question * 5 questions = 25
   let affectShiftPct = null;
-  if (affectBefore !== null && affectAfter !== null) {
-    affectShiftPct = Math.round(((affectAfter - affectBefore) / 25) * 100);
+  if (befRow && aftRow) {
+    const q1gain = Math.max(0, (befRow.q1 || 0) - (aftRow.q1 || 0));
+    const q2gain = Math.max(0, (befRow.q2 || 0) - (aftRow.q2 || 0));
+    const q3gain = Math.max(0, (aftRow.q3 || 0) - (befRow.q3 || 0));
+    const q4gain = Math.max(0, (aftRow.q4 || 0) - (befRow.q4 || 0));
+    const q5gain = Math.max(0, (aftRow.q5 || 0) - (befRow.q5 || 0));
+    const totalGain = q1gain + q2gain + q3gain + q4gain + q5gain;
+    // Max possible from this starting point (not from zero — from where they were)
+    const maxFromBefore =
+      (befRow.q1 || 0) +    // q1: max gain = before value (reduce to 0)
+      (befRow.q2 || 0) +    // q2: max gain = before value
+      (5 - (befRow.q3 || 0)) + // q3: max gain = 5 minus before
+      (5 - (befRow.q4 || 0)) + // q4: max gain = 5 minus before
+      (5 - (befRow.q5 || 0));  // q5: max gain = 5 minus before
+    // Fall back to absolute max (25) if maxFromBefore is 0
+    const divisor = maxFromBefore > 0 ? maxFromBefore : 25;
+    affectShiftPct = Math.round((totalGain / divisor) * 1000) / 10; // one decimal place
+  } else if (affectBefore !== null && affectAfter !== null) {
+    // Legacy fallback: only totals available — use simple formula
+    affectShiftPct = Math.round(((affectAfter - affectBefore) / 25) * 100 * 10) / 10;
   }
 
   // Generate compressed summary — include actual assignment text so AI doesn't say "none"
@@ -1215,10 +1240,20 @@ Format exactly as:
 THEME: [one sentence — the emotional/psychological core of what the person was crossing today]
 MOVEMENT: [one sentence — what actually shifted in this session, with honest weight. Do not default to "slight." A self-renaming, a lifted head, a new frame for one's life — these are significant movements even if quiet. Name what moved and how much.]
 ASSIGNMENT: [the exact assignment given below, compressed to one sentence — do not write "none" if an assignment is provided]
-FLAGS: [any risk signals — or "none"]
+FLAGS: [clinical risk signals only — see rules below]
 PATTERNS: [any recurring patterns visible — or "none"]
 
 Calibration note on MOVEMENT: "Slight" should only be used if genuinely nothing shifted. If the person named themselves, reached toward something, or showed any change in volitional capacity, that is moderate-to-significant movement. Match the weight of the movement to the evidence.
+
+CRITICAL FLAG CLASSIFICATION RULES:
+Before generating FLAGS, classify each potential flag as one of:
+- INTERNAL STATE: Person describing their own psychological/emotional/bodily experience → may be clinically significant
+- EXTERNAL EVENT REPORT: Person describing something that happened outside them (e.g. "you have frozen", "the screen went blank", "my phone rang") → DO NOT flag clinically; note as session event only if it interrupted a significant moment
+- TECHNICAL REPORT: Person commenting on the session technology or connection → exclude entirely from clinical flags
+
+Only INTERNAL STATE language can generate clinical flags. External event reports must never generate dissociation, overwhelm, or psychological risk flags.
+
+CONNECTIVITY EVENTS: If the transcript shows the person saying something like "you have frozen", "you disappeared", "are you there", "the connection dropped" — this is a connectivity rupture, not a clinical signal. Note it as: "Connectivity rupture occurred mid-session — learner named it and remained present. Review transcript at reconnection point to assess whether repair was made."
 
 ASSIGNMENT GIVEN THIS SESSION:
 ${assignmentGiven || 'No assignment was given this session.'}
