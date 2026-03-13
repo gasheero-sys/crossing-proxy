@@ -1818,7 +1818,7 @@ app.get('/sessions/:id/witness-letter', auth, async (req, res) => {
 });
 
 // Witness letter HTML viewer — rich layout with PDF print support
-app.get('/witness/:id', auth, async (req, res) => {
+app.get('/witness/:id', async (req, res) => {
   const sessionId = req.params.id;
   const showPract = req.query.view !== 'client'; // ?view=client hides practitioner note
   let letter = '';
