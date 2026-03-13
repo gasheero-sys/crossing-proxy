@@ -7,6 +7,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const PRACTITIONER_PIN = process.env.PRACTITIONER_PIN || '0000';
+const WITNESS_AGGREGATOR_URL = process.env.WITNESS_AGGREGATOR_URL || 'http://localhost:5001';
+const AGGREGATOR_SECRET = process.env.AGGREGATOR_SECRET || 'anewleaf-aggregator-2026';
 
 // Log environment on startup
 console.log('DATABASE_URL set:', !!process.env.DATABASE_URL);
@@ -313,6 +315,16 @@ async function initDB() {
         dismissed BOOLEAN DEFAULT FALSE,
         practitioner_note TEXT,
         detected_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    // Witness letters — pushed from local aggregator after generation
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS witness_letters (
+        id SERIAL PRIMARY KEY,
+        session_id TEXT UNIQUE,
+        letter_text TEXT,
+        practitioner_note TEXT,
+        generated_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
     console.log('Database ready');
@@ -1120,6 +1132,95 @@ async function runPostSessionJobs(clientId, sessionId) {
     // Mark session for manual review — log only, no DB write needed
     console.warn('[post-session-jobs] session', sessionId, 'flagged for manual sovereign moment review');
   }
+
+  // Job 4: Witness Aggregator — fire and forget, never blocks
+  try {
+    await sendToWitnessAggregator(clientId, sessionId, summary);
+    console.log('[post-session-jobs] Job 4 (witness aggregator) complete');
+  } catch (err) {
+    console.warn('[post-session-jobs] Job 4 (witness aggregator) skipped:', err.message);
+  }
+}
+
+function deriveThemesFromSummary(summary, needs) {
+  const themes = [];
+  if (summary) {
+    const line = (summary.match(/THEME:\s*(.+)/i)?.[1] || '').toLowerCase();
+    if (line.includes('betr'))                             themes.push('institutional_betrayal');
+    if (line.includes('confus') || line.includes('ident')) themes.push('identity_confusion');
+    if (line.includes('griev') || line.includes('loss'))   themes.push('grief_unexpressed');
+    if (line.includes('trust'))                            themes.push('trust_dissolution');
+    if (line.includes('shame'))                            themes.push('shame_internalised');
+    if (line.includes('belong') || line.includes('isol'))  themes.push('belonging_displacement');
+    if (line.includes('mean') || line.includes('purpos'))  themes.push('meaning_collapse');
+    if (line.includes('futur') || line.includes('hope'))   themes.push('hope_deferred');
+    if (line.includes('agenc') || line.includes('power'))  themes.push('agency_contraction');
+    if (line.includes('recogn') || line.includes('invisib')) themes.push('recognition_hunger');
+    if (line.includes('time') || line.includes('temporal')) themes.push('temporal_collapse');
+  }
+  // Fill from lowest needs if themes still sparse
+  if (themes.length < 2 && needs) {
+    if ((needs.seen || 0) < 40)    themes.push('recognition_hunger');
+    if ((needs.aimed || 0) < 40)   themes.push('agency_contraction');
+    if ((needs.cheered || 0) < 40) themes.push('hope_deferred');
+    if ((needs.guided || 0) < 40)  themes.push('meaning_collapse');
+  }
+  return [...new Set(themes)].slice(0, 3);
+}
+
+async function sendToWitnessAggregator(clientId, sessionId, summary) {
+  const [sessRow, needsRow, affectsRow, sovereignRow, ecoRow, countRow] = await Promise.all([
+    pool.query('SELECT * FROM sessions WHERE id=$1 AND client_id=$2', [sessionId, clientId]),
+    pool.query('SELECT seen,cheered,aimed,guided,volition_index FROM need_scores WHERE session_id=$1 AND client_id=$2 ORDER BY recorded_at DESC LIMIT 1', [sessionId, clientId]),
+    pool.query('SELECT phase,q1,q2,q3,q4,q5 FROM affect_measurements WHERE session_id=$1 AND client_id=$2 ORDER BY recorded_at ASC', [sessionId, clientId]),
+    pool.query('SELECT moment_text FROM sovereign_moments WHERE session_id=$1 AND client_id=$2 AND detection_tier=1', [sessionId, clientId]),
+    pool.query('SELECT COUNT(*) FROM ecosystem WHERE client_id=$1', [clientId]),
+    pool.query('SELECT COUNT(*) FROM sessions WHERE client_id=$1', [clientId])
+  ]);
+
+  if (!sessRow.rows.length) return;
+  const s = sessRow.rows[0];
+  const needs = needsRow.rows[0] || {};
+  const befRow = affectsRow.rows.find(a => a.phase === 'before') || {};
+  const aftRow = affectsRow.rows.find(a => a.phase === 'after') || {};
+
+  const prevNeeds = await pool.query(
+    `SELECT volition_index FROM need_scores WHERE client_id=$1 AND session_id!=$2 ORDER BY recorded_at DESC LIMIT 1`,
+    [clientId, sessionId]
+  );
+  const prevVI = prevNeeds.rows[0]?.volition_index ?? (needs.volition_index || 0);
+  const vDelta = (needs.volition_index || 0) - prevVI;
+
+  const mapAffect = row => ({
+    energy:  Math.round(((row.q3 || 3) + (row.q4 || 3)) / 2),
+    mood:    row.q2 || 3,
+    safety:  row.q1 ? 6 - row.q1 : 3
+  });
+
+  const payload = {
+    session_id:    `crossing_${sessionId}`,
+    learner_id:    `client_${clientId}`,
+    session_date:  new Date(s.started_at).toISOString().split('T')[0],
+    volition_index: needs.volition_index || 0,
+    volition_delta: vDelta,
+    four_needs:   { seen: needs.seen||0, cheered: needs.cheered||0, aimed: needs.aimed||0, guided: needs.guided||0 },
+    affect_start:  mapAffect(befRow),
+    affect_end:    mapAffect(aftRow),
+    feeling_seen:  { start: befRow.q5 || 3, end: aftRow.q5 || 3 },
+    scaffold_engagement: [],
+    dominant_themes: deriveThemesFromSummary(summary, needs),
+    sovereign_moments: sovereignRow.rows.map(r => r.moment_text),
+    ecosystem_nodes: parseInt(ecoRow.rows[0].count),
+    is_first_session: parseInt(countRow.rows[0].count) <= 1
+  };
+
+  const resp = await fetch(`${WITNESS_AGGREGATOR_URL}/api/v1/sessions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(5000)
+  });
+  if (!resp.ok) throw new Error(`Aggregator responded ${resp.status}`);
 }
 
 async function writeRawArchive(clientId, sessionId) {
@@ -1671,6 +1772,275 @@ app.post('/practitioner/migrate-profiles', practAuth, async (req, res) => {
     }
     console.log('[migrate] all clients processed');
   } catch (err) { console.error('[migrate] fatal:', err.message); }
+});
+
+// Internal endpoint — aggregator pushes letters here after generation
+app.post('/internal/witness-letter', async (req, res) => {
+  const { session_id, letter, practitioner_note, secret } = req.body || {};
+  if (secret !== AGGREGATOR_SECRET)
+    return res.status(401).json({ error: 'Unauthorized' });
+  if (!session_id || !letter)
+    return res.status(400).json({ error: 'session_id and letter required' });
+  try {
+    await pool.query(
+      `INSERT INTO witness_letters (session_id, letter_text, practitioner_note)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (session_id) DO UPDATE
+         SET letter_text=$2, practitioner_note=$3, generated_at=NOW()`,
+      [session_id, letter, practitioner_note || null]
+    );
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Witness letter JSON — read from Railway DB, fall back to aggregator
+app.get('/sessions/:id/witness-letter', auth, async (req, res) => {
+  const sessionId = req.params.id;
+  try {
+    const db = await pool.query(
+      'SELECT * FROM witness_letters WHERE session_id=$1',
+      [`crossing_${sessionId}`]
+    );
+    if (db.rows.length) {
+      const r = db.rows[0];
+      return res.json({ session_id: sessionId, letter: r.letter_text, practitioner_note: r.practitioner_note });
+    }
+    // Fallback: try local aggregator (works in dev)
+    const resp = await fetch(
+      `${WITNESS_AGGREGATOR_URL}/api/v1/witness-letter/crossing_${sessionId}`,
+      { signal: AbortSignal.timeout(5000) }
+    );
+    const data = await resp.json();
+    res.json(data);
+  } catch (err) {
+    res.json({ error: 'Letter not yet available', session_id: sessionId });
+  }
+});
+
+// Witness letter HTML viewer — rich layout with PDF print support
+app.get('/witness/:id', auth, async (req, res) => {
+  const sessionId = req.params.id;
+  const showPract = req.query.view !== 'client'; // ?view=client hides practitioner note
+  let letter = '';
+  let practNote = '';
+  let generated = '';
+
+  try {
+    // Read from Railway DB first
+    const db = await pool.query(
+      'SELECT * FROM witness_letters WHERE session_id=$1',
+      [`crossing_${sessionId}`]
+    );
+    if (db.rows.length) {
+      const r = db.rows[0];
+      letter = r.letter_text || '';
+      practNote = r.practitioner_note || '';
+      generated = r.generated_at ? new Date(r.generated_at).toISOString() : '';
+    } else {
+      // Fallback: try local aggregator (works in dev)
+      const resp = await fetch(
+        `${WITNESS_AGGREGATOR_URL}/api/v1/witness-letter/crossing_${sessionId}`,
+        { signal: AbortSignal.timeout(6000) }
+      );
+      const data = await resp.json();
+      if (data.letter) { letter = data.letter; practNote = data.practitioner_note || ''; }
+      else { letter = data.error || 'Letter not yet generated.'; }
+    }
+  } catch (_) { letter = 'Letter not yet available. The session may still be processing.'; }
+
+  const fmt = t => {
+    if (!t) return '';
+    return t
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/\n\n/g,'</p><p>').replace(/\n/g,'<br>')
+      .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
+      .replace(/\*(.+?)\*/g,'<em>$1</em>')
+      .replace(/^([A-Z ]{4,}:)/gm,'<span class="label">$1</span>');
+  };
+
+  const dateStr = new Date().toLocaleDateString('en-GB', {day:'numeric',month:'long',year:'numeric'});
+
+  res.send(`<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Witness Letter · Session ${sessionId}</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --ink: #1a1a1a;
+    --mid: #555;
+    --faint: #999;
+    --rule: #ddd;
+    --bg: #faf9f7;
+    --pract-bg: #f4f0e8;
+    --pract-border: #c8b89a;
+    --accent: #7a5c3a;
+  }
+
+  body {
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 16px;
+    line-height: 1.85;
+    color: var(--ink);
+    background: var(--bg);
+    padding: 0;
+  }
+
+  /* ── TOOLBAR (screen only) ── */
+  .toolbar {
+    position: sticky; top: 0; z-index: 10;
+    background: white;
+    border-bottom: 1px solid var(--rule);
+    padding: 12px 32px;
+    display: flex; align-items: center; gap: 12px;
+    font-family: -apple-system, sans-serif; font-size: 13px; color: var(--mid);
+  }
+  .toolbar strong { color: var(--ink); font-weight: 600; margin-right: auto; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 7px 14px; border-radius: 6px; border: 1px solid var(--rule);
+    background: white; color: var(--ink); cursor: pointer;
+    font-family: inherit; font-size: 13px; text-decoration: none;
+    transition: background .15s;
+  }
+  .btn:hover { background: #f5f5f5; }
+  .btn-primary { background: var(--accent); color: white; border-color: var(--accent); }
+  .btn-primary:hover { background: #6a4c2e; }
+  .view-toggle { display: flex; gap: 0; border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; }
+  .view-toggle a { padding: 7px 12px; text-decoration: none; color: var(--mid); font-size: 12px; font-family: -apple-system, sans-serif; }
+  .view-toggle a.active { background: var(--ink); color: white; }
+
+  /* ── PAGE ── */
+  .page {
+    max-width: 740px; margin: 0 auto; padding: 60px 40px 80px;
+  }
+
+  /* ── HEADER ── */
+  .doc-header {
+    border-bottom: 2px solid var(--ink);
+    padding-bottom: 20px;
+    margin-bottom: 36px;
+  }
+  .doc-header .eyebrow {
+    font-family: -apple-system, sans-serif;
+    font-size: 10px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--faint); margin-bottom: 8px;
+  }
+  .doc-header h1 {
+    font-size: 1.5rem; font-weight: 400; letter-spacing: .02em;
+    color: var(--ink);
+  }
+  .doc-header .meta {
+    margin-top: 10px;
+    font-family: -apple-system, sans-serif;
+    font-size: 12px; color: var(--mid);
+    display: flex; gap: 24px;
+  }
+  .doc-header .meta span::before { content: attr(data-label) ': '; color: var(--faint); }
+
+  /* ── LETTER ── */
+  .letter-body { font-size: 1.05rem; }
+  .letter-body p { margin-bottom: 1.4em; }
+  .letter-body em { font-style: italic; }
+
+  .letter-close {
+    margin-top: 2.5rem;
+    font-size: 1rem; font-style: italic; color: var(--mid);
+    border-top: 1px solid var(--rule); padding-top: 1.5rem;
+  }
+
+  /* ── PRACTITIONER NOTE ── */
+  .pract-section {
+    margin-top: 56px;
+    border: 1px solid var(--pract-border);
+    border-radius: 8px;
+    background: var(--pract-bg);
+    padding: 32px 36px;
+  }
+  .pract-section .pract-header {
+    font-family: -apple-system, sans-serif;
+    font-size: 10px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 4px;
+  }
+  .pract-section h2 {
+    font-size: 1rem; font-weight: 600; color: var(--ink);
+    margin-bottom: 20px; border-bottom: 1px solid var(--pract-border); padding-bottom: 12px;
+  }
+  .pract-body { font-size: .93rem; line-height: 1.8; font-family: -apple-system, sans-serif; }
+  .pract-body p { margin-bottom: 1em; }
+  .pract-body .label {
+    display: block;
+    font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--accent); font-weight: 600; margin-top: 1.2em; margin-bottom: 2px;
+  }
+  .pract-confidential {
+    margin-top: 16px; padding: 8px 12px;
+    background: rgba(122,92,58,.08); border-left: 3px solid var(--pract-border);
+    font-size: 11px; color: var(--mid); font-family: -apple-system, sans-serif;
+    font-style: italic;
+  }
+
+  /* ── PRINT ── */
+  @media print {
+    .toolbar { display: none !important; }
+    body { background: white; }
+    .page { padding: 0; max-width: 100%; }
+    .pract-section { break-before: page; border: 1px solid #ccc; background: #fafafa; }
+    .doc-header { border-bottom-color: black; }
+    @page { margin: 25mm 20mm; }
+  }
+
+  @media (max-width: 600px) {
+    .page { padding: 32px 20px 60px; }
+    .toolbar { padding: 10px 16px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="toolbar">
+  <strong>Witness Letter — Session ${sessionId}</strong>
+  <div class="view-toggle">
+    <a href="/witness/${sessionId}?token=${req.headers['x-auth-token'] || req.query.token || ''}" class="${showPract ? 'active' : ''}">Full</a>
+    <a href="/witness/${sessionId}?view=client&token=${req.headers['x-auth-token'] || req.query.token || ''}" class="${!showPract ? 'active' : ''}">Client view</a>
+  </div>
+  <button class="btn btn-primary" onclick="window.print()">&#x2399; Print / Save PDF</button>
+</div>
+
+<div class="page">
+
+  <div class="doc-header">
+    <div class="eyebrow">ANewLeaf Mental Health Practice</div>
+    <h1>A Witness Letter</h1>
+    <div class="meta">
+      <span data-label="Session">${sessionId}</span>
+      <span data-label="Date">${dateStr}</span>
+      <span data-label="Document">Confidential — Clinical Record</span>
+    </div>
+  </div>
+
+  <div class="letter-body">
+    <p>${fmt(letter)}</p>
+  </div>
+
+${showPract && practNote ? `
+  <div class="pract-section">
+    <div class="pract-header">For Practitioner Use Only</div>
+    <h2>Macro → Micro Bridge &nbsp;·&nbsp; Zeitgeist Engine Reading</h2>
+    <div class="pract-body">
+      <p>${fmt(practNote)}</p>
+    </div>
+    <div class="pract-confidential">
+      This note is generated from live Zeitgeist Engine analyses and community ground signal data.
+      It is for clinical orientation only — not to be shared with the learner.
+    </div>
+  </div>
+` : ''}
+
+</div>
+</body></html>`);
 });
 
 initDB().then(() => {
